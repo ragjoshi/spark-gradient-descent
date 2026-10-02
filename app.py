@@ -208,10 +208,19 @@ label = st.selectbox("Label column (what to predict)", columns,
                      index=columns.index(guess))
 
 clean_path = os.path.join(session_dir(), "clean.csv")
-try:
-    summary = clean_csv(raw_path, label, clean_path)
-except DataError as e:
-    st.error(str(e))
+# Cleaning a large file takes seconds (about 20 s for 1M rows), and Streamlit
+# reruns this script on every widget change, so clean once per (file, label).
+clean_key = (st.session_state.upload_id, label)
+if st.session_state.get("clean_key") != clean_key:
+    with st.spinner("Checking the file..."):
+        try:
+            st.session_state.clean_result = clean_csv(raw_path, label, clean_path)
+        except DataError as e:
+            st.session_state.clean_result = DataError(str(e))
+    st.session_state.clean_key = clean_key
+summary = st.session_state.clean_result
+if isinstance(summary, DataError):
+    st.error(str(summary))
     st.stop()
 
 notes = [f"{summary['rows']:,} rows", f"{summary['n_features']} features"]

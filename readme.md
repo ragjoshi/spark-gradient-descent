@@ -198,6 +198,9 @@ Things to know:
   a note in that case.
 - The app sets `PYSPARK_PYTHON` to its own interpreter, and on macOS sets
   `JAVA_HOME` to Java 21 if it is installed and `JAVA_HOME` is not already set.
+- Uploads up to 1 GB are allowed (set in `.streamlit/config.toml`, which Streamlit
+  reads when the app is started from the project folder). The full 1M-row HIGGS file
+  with a header row is about 700 MB.
 - Restart the app after editing `train.py` or `preprocess.py`; Streamlit does not
   reload imported modules.
 

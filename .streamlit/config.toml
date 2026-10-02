@@ -1,0 +1,3 @@
+[server]
+# Uploads up to 1 GB (the full 1M-row HIGGS CSV is about 700 MB).
+maxUploadSize = 1024
