@@ -177,30 +177,64 @@ def comparison_chart(rows):
                     use_container_width=True)
 
 
-def show_numpy_comparison(runs, numpy):
+def machine_ram_gb():
+    try:
+        # Binary GB, the unit RAM is sold in (an "8 GB" Mac has 8 * 2**30 bytes).
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2**30
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def spark_recommendation(spark_s, np_s, data_gb, ram_gb):
+    """
+    Whether to use Spark RDD for this data on this machine, from measured
+    times (np_s is None if the NumPy run failed). Returns (use_spark,
+    headline, reasons).
+    """
+    fits = ram_gb is None or data_gb < ram_gb
+    size = f"The data takes about {data_gb:.2f} GB in memory"
+    size += f"; this machine has {ram_gb:.0f} GB of RAM." if ram_gb else "."
+    if np_s is None:
+        return True, "Use Spark RDD", [
+            "Plain NumPy could not finish on this machine.", size]
+    if spark_s < np_s:
+        return True, "Use Spark RDD", [
+            f"Spark was {np_s / spark_s:.1f}x faster than plain NumPy here.", size]
+    reasons = [f"Plain NumPy was {spark_s / np_s:.1f}x faster than Spark's best run.",
+               size + (" It fits, so one process can hold all of it." if fits else "")]
+    if fits:
+        reasons.append(
+            "Spark costs a fixed amount every iteration (scheduling tasks, moving "
+            "data between the JVM and Python), and here that cost is larger than "
+            "the math. Switch to Spark when the data outgrows one machine's "
+            "memory, as in the **Recorded cluster run** tab, where Spark on 4 "
+            "machines was 30x faster.")
+        if ram_gb and data_gb > 0.5 * ram_gb:
+            reasons.append("The data already uses over half of this machine's "
+                           "memory, so it is getting close to that point.")
+    return False, "Don't use Spark RDD for this data. Use plain NumPy.", reasons
+
+
+def show_recommendation(use_spark, headline, reasons):
+    st.subheader("Recommendation")
+    box = st.success if use_spark else st.info
+    box(f"**{headline}**\n\n" + "\n".join(f"- {r}" for r in reasons))
+
+
+def show_numpy_comparison(runs, numpy, data_gb):
     st.subheader("Spark vs. plain NumPy")
+    best = min(runs, key=lambda r: r["sec_per_iter_warm"])
+    spark_s = best["sec_per_iter_warm"]
     if "error" in numpy:
         st.warning("The NumPy comparison failed: " + numpy["error"])
+        show_recommendation(*spark_recommendation(spark_s, None, data_gb, machine_ram_gb()))
         return
-    best = min(runs, key=lambda r: r["sec_per_iter_warm"])
-    spark_s, np_s = best["sec_per_iter_warm"], numpy["sec_per_iter_warm"]
+    np_s = numpy["sec_per_iter_warm"]
     rows = [(f"Spark, {r['cores']} core" + ("" if r["cores"] == 1 else "s"),
              r["sec_per_iter_warm"], "Spark") for r in runs]
     rows.append(("NumPy, 1 process", np_s, "NumPy"))
     comparison_chart(rows)
-    if np_s < spark_s:
-        st.metric("Faster here", "NumPy",
-                  f"{spark_s / np_s:.1f}x faster than Spark's best "
-                  f"({best['cores']} cores)", delta_color="off")
-        st.write(
-            "On data that fits in one machine's memory, NumPy wins. Each Spark "
-            "iteration pays a fixed cost to schedule tasks and move data between "
-            "the JVM and Python workers, and on this data that cost is larger "
-            "than the math itself. Spark pays off when the data no longer fits "
-            "on one machine; see the **Recorded cluster run** tab.")
-    else:
-        st.metric("Faster here", "Spark",
-                  f"{np_s / spark_s:.1f}x faster than NumPy", delta_color="off")
+    show_recommendation(*spark_recommendation(spark_s, np_s, numpy["gb"], machine_ram_gb()))
     st.caption("NumPy runs the same gradient descent (same data, starting point, "
                "learning rate and iterations) in one process with no Spark, "
                "timed the same way: median per-iteration time, iteration 0 "
@@ -249,13 +283,17 @@ def show_recorded():
              f"{med['numpy-64gb'] / med['spark-e4']:.1f}x faster")
     c.metric("Spark: 2 → 4 machines", f"{med['spark-e2'] / med['spark-e4']:.2f}x faster",
              help="Perfect scaling would be 2.00x.")
-    st.write(
-        "- **The 16 GB machine** cannot hold the data, so every iteration re-reads "
-        "all of it from disk. The cluster keeps it in memory across 4 machines.\n"
-        "- **One big machine is the real competitor:** a 64 GB machine running "
-        "NumPy matches 2 Spark machines. Spark pulls ahead as machines are added.\n"
-        "- **Same answer everywhere:** every 20-iteration run ends at loss "
-        f"{runs['spark-e4'][0]['final_loss']:.6f}.")
+    show_recommendation(True, "Use Spark RDD for this data", [
+        f"The data ({gb:.1f} GB in memory) is bigger than the 16 GB machine's "
+        f"RAM, so plain NumPy re-reads it from disk every iteration; Spark on 4 "
+        f"machines keeps it in memory and is {med['numpy-16gb'] / med['spark-e4']:.0f}x faster.",
+        "If one machine with enough RAM is available, it is a simpler option: a "
+        "64 GB machine running NumPy matched 2 Spark machines. Spark pulls ahead "
+        f"from 4 machines ({med['numpy-64gb'] / med['spark-e4']:.1f}x faster) and keeps "
+        "scaling as machines are added.",
+    ])
+    st.write("**Same answer everywhere:** every 20-iteration run ends at loss "
+             f"{runs['spark-e4'][0]['final_loss']:.6f}.")
     st.dataframe(pd.DataFrame([
         {"Setup": "Spark, 4 × r5.2xlarge", "Seconds per iteration": med["spark-e4"],
          "Runs": len(runs["spark-e4"]), "Final loss": runs["spark-e4"][0]["final_loss"]},
@@ -315,7 +353,9 @@ def show_results(res):
     )
 
     if res.get("numpy"):
-        show_numpy_comparison(runs, res["numpy"])
+        # label + intercept + features, float64; NumPy reports the same figure.
+        data_gb = res["rows"] * (res["features"] + 2) * 8 / 1e9
+        show_numpy_comparison(runs, res["numpy"], data_gb)
 
     show_recommended_cores(table)
 
@@ -414,7 +454,7 @@ with live:
 
     if source.startswith("HIGGS"):
         # Already numeric and clean: no header, label in column 0.
-        data_path, label, n_rows = HIGGS, None, 1_000_000
+        data_path, label, n_rows, n_features = HIGGS, None, 1_000_000, 28
         data_key = ("higgs",)
         st.success("Ready: 1,000,000 rows of HIGGS; 28 features; label in column 0.")
     else:
@@ -465,7 +505,7 @@ with live:
                 "with no gaps): " + ", ".join(summary["likely_id_columns"]) + ". "
                 "They are being used as features, which teaches the model nothing "
                 "real. Remove them from the file if they are IDs.")
-        n_rows = summary["rows"]
+        n_rows, n_features = summary["rows"], summary["n_features"]
         data_key = ("upload", st.session_state.upload_id, label)
 
     c1, c2, c3 = st.columns(3)
@@ -520,7 +560,8 @@ with live:
             numpy = run_numpy(data_path, label, iters)
             progress.empty()
             st.session_state.results = {"runs": runs, "check": check, "numpy": numpy,
-                                        "rows": n_rows, "key": run_key}
+                                        "rows": n_rows, "features": n_features,
+                                        "key": run_key}
         finally:
             lock.release()
 
