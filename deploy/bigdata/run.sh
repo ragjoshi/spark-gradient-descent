@@ -3,6 +3,8 @@
 #
 #   deploy/bigdata/run.sh check     # credentials, region, vCPU quotas; launches nothing
 #   deploy/bigdata/run.sh up        # create bucket, upload code, launch everything
+#   deploy/bigdata/run.sh emr       # (re)launch the EMR cluster only
+#   deploy/bigdata/run.sh numpy [name]  # (re)launch the NumPy instances only
 #   deploy/bigdata/run.sh status    # what is still running, which results are in
 #   deploy/bigdata/run.sh results   # download results and print the comparison
 #   deploy/bigdata/run.sh down      # terminate anything still running (keeps S3 data)
@@ -51,7 +53,13 @@ check() {
 
 up() {
   check
-  aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null || {
+  emr
+  numpy
+  echo "Launched. Check progress with: deploy/bigdata/run.sh status"
+}
+
+emr() {   # create the bucket if needed, upload the code, launch the cluster
+  aws s3api head-bucket --bucket "$BUCKET" >/dev/null 2>&1 || {
     if [ "$REGION" = us-east-1 ]; then aws s3api create-bucket --bucket "$BUCKET" >/dev/null
     else aws s3api create-bucket --bucket "$BUCKET" \
            --create-bucket-configuration LocationConstraint="$REGION" >/dev/null; fi
@@ -94,11 +102,19 @@ EOF
     --steps "file://$tmp/steps.json" --auto-terminate \
     --tags "project=$TAG" --query ClusterId --output text)
   echo "EMR cluster $cluster ($release) starting"
-
-  launch_numpy numpy-16gb m6id.xlarge "--stream --iters 6"
-  launch_numpy numpy-64gb r6id.2xlarge "--iters 20"
   rm -rf "$tmp"
-  echo "Launched. Check progress with: deploy/bigdata/run.sh status"
+}
+
+numpy() {   # numpy [numpy-16gb|numpy-64gb]: upload the code, launch one or both
+  aws s3 cp --quiet "$ROOT/numpy_baseline.py" "s3://$BUCKET/code/numpy_baseline.py"
+  aws s3 cp --quiet "$ROOT/make_big_data.py" "s3://$BUCKET/code/make_big_data.py"
+  local which=${1:-all}
+  if [ "$which" = all ] || [ "$which" = numpy-16gb ]; then
+    launch_numpy numpy-16gb m6id.xlarge "--stream --iters 6"
+  fi
+  if [ "$which" = all ] || [ "$which" = numpy-64gb ]; then
+    launch_numpy numpy-64gb r6id.2xlarge "--iters 20"
+  fi
 }
 
 launch_numpy() {   # launch_numpy <name> <instance type> <numpy_baseline flags>
@@ -179,6 +195,7 @@ down() {
 }
 
 case "${1:-}" in
-  check|up|status|results|down) "$1" ;;
-  *) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  check|up|emr|status|results|down) "$1" ;;
+  numpy) numpy "${2:-all}" ;;
+  *) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

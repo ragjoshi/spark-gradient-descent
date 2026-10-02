@@ -15,6 +15,8 @@ COPIES=${COPIES:-10}
 ITERS=${ITERS:-20}
 PARTS=${PARTS:-128}          # ~4 tasks per core on 32 cores
 CORES_PER_NODE=8             # the core fleet is all 8-vCPU, 64 GB types
+PY=/opt/bench-venv/bin/python   # from emr_bootstrap.sh
+[ -x "$PY" ] || PY=python3
 
 # 1. HIGGS (11M rows, 7.5 GB as CSV) straight from UCI into S3, then
 #    server-side copies to make COPIES x HIGGS. The READY marker tells the
@@ -37,6 +39,7 @@ run() {
     --num-executors "$executors" --executor-cores $CORES_PER_NODE \
     --executor-memory 34g --conf spark.executor.memoryOverhead=12g \
     --conf spark.dynamicAllocation.enabled=false \
+    --conf spark.pyspark.python=$PY --conf spark.pyspark.driver.python=$PY \
     --conf spark.scheduler.minRegisteredResourcesRatio=1.0 \
     --conf spark.scheduler.maxRegisteredResourcesWaitingTime=600s \
     --py-files $CODE/train.py,$CODE/gradient.py \
