@@ -75,6 +75,20 @@ def npy_chunks(y, X, chunk_mb):
         yield y[a:a + rows], np.asarray(X[a:a + rows])
 
 
+if args.npy and not args.stream:
+    # Loading needs room for all of X and y; report "does not fit" as the
+    # result instead of letting the machine run out of memory.
+    rows, cols = np.load(f"{args.npy}.X.npy", mmap_mode="r").shape
+    need_gb = rows * (cols + 1) * 8 / 1e9
+    ram_gb = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 1e9
+    if need_gb > 0.85 * ram_gb:
+        msg = (f"The data ({need_gb:.1f} GB) does not fit in this machine's "
+               f"memory ({ram_gb:.0f} GB).")
+        print(msg)
+        print(json.dumps({"error": msg, "kind": "memory", "records": rows,
+                          "features": cols - 1, "gb": need_gb, "ram_gb": ram_gb}))
+        raise SystemExit(0)
+
 t0 = time.perf_counter()
 if args.npy:
     # Labels are 1/30 of the data; keep them in memory either way.

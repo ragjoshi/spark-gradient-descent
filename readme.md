@@ -293,14 +293,16 @@ Notes:
 ## Big-data benchmark on AWS
 
 `deploy/bigdata/` tests the case Spark is built for: data larger than one
-machine's memory. It uses 10 copies of the full HIGGS dataset (110M rows,
-75 GB as CSV, 26 GB as float64) and compares:
+machine's memory. By default it uses 10 copies of the full HIGGS dataset
+(110M rows, 75 GB as CSV, 26 GB as float64); `--data` runs it on any CSV
+instead. It compares:
 
-- **Spark** on an EMR cluster (4 spot nodes, 8 vCPUs and 64 GB each), data
-  cached in memory across the nodes, run on all 4 nodes and on 2.
+- **Spark** on an EMR cluster (4 spot nodes by default, 8 vCPUs and 64 GB
+  each), data cached in memory across the nodes, run on all nodes and on half.
 - **NumPy on a 16 GB machine** (`m6id.xlarge`), which must re-read the data
   from its NVMe disk on every iteration (`numpy_baseline.py --stream`).
-- **NumPy on a 64 GB machine** (`r6id.2xlarge`), which holds it all in RAM.
+- **NumPy on a 64 GB machine** (`r6id.2xlarge`), which holds it all in RAM,
+  or reports that it does not fit.
 
 All three report the loss after the same number of iterations, which must
 match. Requirements: the AWS CLI, configured with credentials and a region.
@@ -313,10 +315,28 @@ deploy/bigdata/run.sh results   # download and compare
 deploy/bigdata/run.sh down      # stop anything still running
 ```
 
+To benchmark your own data, pass it to `check` and `up`:
+
+```bash
+deploy/bigdata/run.sh up --data s3://my-bucket/sales/ --label churned
+deploy/bigdata/run.sh up --data ~/data/big.csv --label target --copies 3 --nodes 2
+```
+
+`--data` takes a local file or folder (uploaded to S3 first), an `s3://` file,
+or an `s3://` folder ending in `/`. Without `--label` the files are in the
+HIGGS layout (no header, label in column 0); with it, each file has a header
+row. The data must already be clean: all values numeric, no missing values,
+and a 0/1 label (the cluster does not run the app's file checker, which loads
+everything on one machine). `--copies K` repeats the data K times, `--nodes N`
+sets the cluster size, and `--name` sets the results folder. Each run's
+results go to `deploy/bigdata/results/<name>/`, and the app's
+**Recorded cluster runs** tab shows every run there, with a recommendation:
+plain NumPy, one big machine, or Spark.
+
 ### Results (October 2026, us-east-1)
 
 Same data in every row: 110M rows, 26.4 GB as float64. Raw JSON is in
-`deploy/bigdata/results/`.
+`deploy/bigdata/results/higgs10x/`.
 
 | Setup | s/iter | vs. Spark on 4 nodes | Final loss |
 |---|--:|--:|--:|

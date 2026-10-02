@@ -1,14 +1,19 @@
 #!/bin/bash
 # EC2 user data for the single-machine NumPy baseline (Amazon Linux 2023).
-# run.sh fills in the three placeholders below before launching.
+# run.sh fills in the placeholders below before launching.
 #
-# The instance builds the same COPIES x HIGGS dataset on its local NVMe disk,
-# runs numpy_baseline.py, uploads the result, and shuts down. It is launched
-# with "terminate on shutdown", so shutting down deletes it.
+# The instance builds the run's dataset on its local NVMe disk (streamed
+# from S3, repeated COPIES times), runs numpy_baseline.py, uploads the
+# result, and shuts down. It is launched with "terminate on shutdown", so
+# shutting down deletes it.
 BUCKET=__BUCKET__
 NAME=__NAME__                # numpy-16gb or numpy-64gb
 FLAGS="__FLAGS__"            # e.g. "--stream --iters 6"
-COPIES=10
+RUN=__RUN__                  # results go to s3://$BUCKET/results/$RUN/
+SRC=__SRC__                  # s3:// file or folder ending in /
+LABEL="__LABEL__"            # empty: HIGGS layout (no header, label in column 0)
+COPIES=__COPIES__
+RES=s3://$BUCKET/results/$RUN
 
 shutdown -h +150             # hard cap: gone after 2.5 hours whatever happens
 # Also copy output to the serial console, so "aws ec2 get-console-output"
@@ -16,7 +21,7 @@ shutdown -h +150             # hard cap: gone after 2.5 hours whatever happens
 exec > >(tee /var/log/bench.log /dev/console) 2>&1
 finish() {
   local code=$?
-  aws s3 cp /var/log/bench.log "s3://$BUCKET/results/logs/$NAME.log" || true
+  aws s3 cp /var/log/bench.log "$RES/logs/$NAME.log" || true
   # On failure, stay up 3 minutes so the console output can be read.
   [ "$code" = 0 ] || sleep 180
   shutdown -h now
@@ -40,18 +45,16 @@ mount "$DEV" /data
 aws s3 cp --recursive "s3://$BUCKET/code/" /data/code
 cd /data/code
 
-# Wait for the EMR step to put HIGGS in S3 (up to 90 minutes).
+# Wait until the data is in S3 (the cluster downloads HIGGS; up to 90 minutes).
 for _ in $(seq 180); do
-  aws s3 ls "s3://$BUCKET/higgs/READY" >/dev/null && break
+  aws s3 ls "$RES/READY" >/dev/null && break
   sleep 30
 done
-aws s3 cp "s3://$BUCKET/higgs/HIGGS.csv" /data/HIGGS.csv
-$PY make_big_data.py /data/HIGGS.csv /data/big --copies $COPIES
-rm /data/HIGGS.csv
+$PY make_big_data.py /data/big "$SRC" ${LABEL:+--label "$LABEL"} --copies "$COPIES"
 
 # Start from a cold page cache so the first pass is not flattered.
 sync
 echo 3 > /proc/sys/vm/drop_caches
 free -g
 $PY numpy_baseline.py --npy /data/big $FLAGS | tee /tmp/out.txt
-tail -1 /tmp/out.txt | aws s3 cp - "s3://$BUCKET/results/$NAME.json"
+tail -1 /tmp/out.txt | aws s3 cp - "$RES/$NAME.json"

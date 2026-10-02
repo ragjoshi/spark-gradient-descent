@@ -14,7 +14,8 @@
 # --cluster runs under spark-submit on a real cluster (deploy/bigdata/):
 # spark-submit picks the master, <cores> is only a label, --data may be an
 # s3:// path or directory, and partitions are formed with coalesce instead
-# of a full repartition shuffle.
+# of a full repartition shuffle. The data is not run through
+# preprocess.clean_csv, so it must already be numeric with a 0/1 label.
 #
 # The last line of stdout is always one JSON object, for app.py to parse:
 # the run's timing (plus correctness checks with --check), or {"error": ...}.
@@ -44,6 +45,7 @@ def run_once(cores, rep, path=HIGGS, label_col=None, iters=MAX_ITER,
 
         w, stats = train(sc, data, d_feat + 1, lr=LR,
                          max_iter=iters, tol=0.0, verbose=False, mode=mode)
+        stats["features"] = d_feat
 
         # Correctness checks run after the timed loop, so they never
         # affect the timing numbers.
@@ -97,7 +99,10 @@ def main():
             print(json.dumps({"error": f"File not found: {path}", "kind": "data"}))
             return 2
 
-        if args.label is not None:
+        # clean_csv loads the whole file with pandas on this machine, so it is
+        # skipped for cluster runs: their data must already be clean (numeric,
+        # no missing values, 0/1 label).
+        if args.label is not None and not args.cluster:
             from preprocess import DataError, clean_csv
             cleaned = tempfile.NamedTemporaryFile(suffix=".csv", delete=False).name
             try:

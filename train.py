@@ -54,6 +54,7 @@ def load_csv(sc, path, label_col=None, n_parts=8, shuffle=True):
 
     label_col=None: no header row, label in column 0 (the HIGGS layout).
     label_col=name: first line is a header; the label is the named column.
+                    With a directory of CSVs, each file may repeat the header.
 
     Every non-header value must parse as a float; run preprocess.clean_csv
     first on untrusted files. Returns (rdd, d_feat).
@@ -63,7 +64,7 @@ def load_csv(sc, path, label_col=None, n_parts=8, shuffle=True):
     shuffle=False uses coalesce, which only merges input splits and avoids
     shuffling the whole dataset (for inputs far larger than n_parts splits).
     """
-    if "://" in path:
+    if "://" in path or os.path.isdir(path):
         first = next(csv.reader([sc.textFile(path).first()]))
     else:
         first = _first_line(path)
@@ -84,9 +85,11 @@ def load_csv(sc, path, label_col=None, n_parts=8, shuffle=True):
 
     lines = sc.textFile(path)
     if label_col is not None:
-        lines = lines.mapPartitionsWithIndex(
-            lambda i, it: itertools.islice(it, 1, None) if i == 0 else it)
-    rows = lines.map(parse)
+        # Drop every copy of the header line, not just the first: a directory
+        # of CSVs usually has one header per file.
+        header = lines.first()
+        lines = lines.filter(lambda line: line != header)
+    rows = lines.filter(lambda line: line.strip()).map(parse)
     rows = rows.repartition(n_parts) if shuffle else rows.coalesce(n_parts)
     return rows, d_feat
 
