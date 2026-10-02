@@ -104,9 +104,12 @@ the serial fraction cited as an estimated single-digit-percent range.
 ```
 spark-project/
 ├── gradient.py      # Core math: gradient, loss, sigmoid (validated, standalone)
-├── train.py         # Training driver: distributed GD loop over the RDD
-├── bench.py         # Strong-scaling benchmark harness
+├── train.py         # Training driver: CSV loader, distributed GD loop, correctness checks
+├── preprocess.py    # Validates and cleans uploaded CSVs with readable errors
+├── bench.py         # Strong-scaling benchmark harness (one run per process, JSON output)
+├── app.py           # Streamlit front end: upload a CSV, run the scaling benchmark
 ├── analyze.py       # Computes speedup / efficiency / serial fraction from results.csv
+├── requirements.txt # Pinned Python dependencies
 ├── results.csv      # Clean benchmark results (9 runs: 1/2/4 cores × 3 reps)
 ├── results_raw.csv  # Unfiltered measurement log (includes caught contamination)
 └── higgs_1m.csv     # 1M-row HIGGS subset (28 features + label) — not committed
@@ -114,11 +117,13 @@ spark-project/
 
 ## Running it
 
-Requirements: Python 3.12, PySpark, NumPy, scikit-learn (for the validation baseline),
-and a JDK (developed against OpenJDK 21, ARM64).
+Requirements: Python 3.12 and a JDK supported by Spark 4 (17 or 21; developed against
+OpenJDK 21, ARM64). Python dependencies are pinned in `requirements.txt`: PySpark,
+NumPy, scikit-learn (validation baseline), pandas (CSV preprocessing), and Streamlit
+(the app).
 
 ```bash
-pip install pyspark numpy scikit-learn
+pip install -r requirements.txt
 ```
 
 A single benchmark run takes the core count and repetition index as positional
@@ -128,9 +133,23 @@ arguments:
 python bench.py <cores> <rep>     # e.g. python bench.py 4 0
 ```
 
+With no other options this runs the HIGGS benchmark (50 iterations) and appends the
+result to `results.csv`. To benchmark any numeric CSV with a header row and a 0/1
+label column instead:
+
+```bash
+python bench.py 4 0 --data mydata.csv --label target --iters 30 --check
+```
+
+Custom-data runs never write to `results.csv`. `--check` adds the correctness checks
+(scikit-learn cosine similarity, and an exact comparison against the same gradient
+descent run in plain NumPy). The last line of output is always a JSON object.
+
 `train.py` is imported by `bench.py` (it exposes the loader, standardizer, and training
-loop) rather than run directly. Once results are collected, compute the speedup /
-efficiency / serial-fraction table with:
+loop). It can also be run directly for a single 200-iteration training run with full
+diagnostics: `python train.py` for HIGGS, or `python train.py mydata.csv target`.
+Once results are collected, compute the speedup / efficiency / serial-fraction table
+with:
 
 ```bash
 python analyze.py
@@ -138,6 +157,49 @@ python analyze.py
 
 The HIGGS dataset is available from the UCI Machine Learning Repository; `higgs_1m.csv`
 is a 1,000,000-row subset. It is not committed to the repo due to size.
+
+## Running the app
+
+The Streamlit app lets anyone upload a CSV and watch how training time changes with
+more cores.
+
+```bash
+streamlit run app.py
+```
+
+Then open the URL it prints (usually http://localhost:8501) and:
+
+1. Upload a CSV with a header row, numeric feature columns, and a label column
+   containing only 0 and 1. Comma, semicolon, and tab separators are all accepted.
+2. Pick the label column. The app validates the file immediately: non-numeric columns,
+   bad labels, and similar problems are listed in plain language, rows with missing
+   values are dropped (and counted), and columns that look like row IDs are flagged.
+3. Choose the maximum core count and number of iterations, then click
+   **Run benchmark**.
+
+The app runs `bench.py` once per core count (1, 2, 4, ... up to the maximum), each in
+its own process so every run gets a fresh `SparkContext`. It then shows:
+
+- **Speedup vs 1 core**, actual against ideal linear speedup
+- **Seconds per iteration** and parallel efficiency for each core count
+- **Correctness**: whether the Spark weights match the same gradient descent run in
+  plain NumPy on one machine (datasets up to 200,000 rows), and cosine similarity
+  against scikit-learn. On linearly separable data scikit-learn's unregularized
+  weights diverge, so the app says when a low cosine is expected.
+
+Things to know:
+
+- All runs use Spark `local[N]` mode on one machine: N worker threads, not a
+  multi-machine cluster.
+- Each core count runs once, so app timings are demonstrations. The results in this
+  README come from `bench.py` with 3 interleaved repetitions per core count.
+- Below about 100,000 rows, Spark's fixed per-iteration overhead outweighs the
+  gradient math, so speedup says little about how the training scales. The app shows
+  a note in that case.
+- The app sets `PYSPARK_PYTHON` to its own interpreter, and on macOS sets
+  `JAVA_HOME` to Java 21 if it is installed and `JAVA_HOME` is not already set.
+- Restart the app after editing `train.py` or `preprocess.py`; Streamlit does not
+  reload imported modules.
 
 ## Notes
 
