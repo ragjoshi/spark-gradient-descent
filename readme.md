@@ -151,7 +151,8 @@ spark-project/
 ├── analyze.py       # Computes speedup / efficiency / serial fraction from results.csv
 ├── requirements.txt # Pinned Python dependencies
 ├── Dockerfile       # Container image for the app (Python 3.12 + Java 21)
-├── deploy/          # EC2 user data + deploy script (see Deploying to AWS)
+├── deploy/          # EC2 app deploy; bigdata/ = cluster benchmark (see Big-data benchmark)
+├── make_big_data.py # Builds K standardized copies of a CSV as .npy for numpy_baseline.py
 ├── results.csv      # Clean benchmark results (9 runs: 1/2/4 cores × 3 reps)
 ├── results_raw.csv  # Unfiltered measurement log (includes caught contamination)
 └── higgs_1m.csv     # 1M-row HIGGS subset (28 features + label) — not committed
@@ -288,6 +289,33 @@ Notes:
   security group restricted to your IPs.
 - Uploads stay in the container's `/tmp` until the next redeploy.
 - **Stop the instance** when you're done. It is billed by the hour while running.
+
+## Big-data benchmark on AWS
+
+`deploy/bigdata/` tests the case Spark is built for: data larger than one
+machine's memory. It uses 10 copies of the full HIGGS dataset (110M rows,
+75 GB as CSV, 26 GB as float64) and compares:
+
+- **Spark** on an EMR cluster (4 spot nodes, 8 vCPUs and 64 GB each), data
+  cached in memory across the nodes, run on all 4 nodes and on 2.
+- **NumPy on a 16 GB machine** (`m6id.xlarge`), which must re-read the data
+  from its NVMe disk on every iteration (`numpy_baseline.py --stream`).
+- **NumPy on a 64 GB machine** (`r6id.2xlarge`), which holds it all in RAM.
+
+All three report the loss after the same number of iterations, which must
+match. Requirements: the AWS CLI, configured with credentials and a region.
+
+```bash
+deploy/bigdata/run.sh check     # credentials and vCPU quotas; launches nothing
+deploy/bigdata/run.sh up        # launch (about $3-8 in total)
+deploy/bigdata/run.sh status
+deploy/bigdata/run.sh results   # download and compare
+deploy/bigdata/run.sh down      # stop anything still running
+```
+
+Every machine terminates itself when its benchmark finishes (hard caps: 3 h
+for the cluster's step, 2.5 h for the NumPy instances). The data stays in S3
+until you delete the bucket; `down` prints the command.
 
 ## Notes
 
