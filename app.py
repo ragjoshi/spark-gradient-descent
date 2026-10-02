@@ -95,6 +95,45 @@ def show_error(result):
             st.code(result["stderr"][-4000:])
 
 
+def recommended_cores(cores, speedups, tolerance=0.10):
+    """Smallest core count whose speedup is within `tolerance` of the best."""
+    best = max(speedups)
+    return min(c for c, s in zip(cores, speedups) if s >= (1 - tolerance) * best)
+
+
+def show_recommended_cores(table):
+    cores = table["Cores"].tolist()
+    speedups = table["Speedup"].tolist()
+    rec = recommended_cores(cores, speedups)
+    best_i = speedups.index(max(speedups))
+    rec_i = cores.index(rec)
+
+    def n_cores(c):
+        return f"{c} core" + ("" if c == 1 else "s")
+
+    st.subheader("Recommended cores")
+    st.caption("Quick estimate for this dataset on this machine.")
+    st.metric("Recommended cores", rec)
+    if rec_i == best_i:
+        why = f"{n_cores(rec)} gave the highest speedup observed ({speedups[rec_i]:.2f}x)."
+    else:
+        why = (f"{n_cores(rec)} reached {speedups[rec_i]:.2f}x, within 10% of the "
+               f"best observed ({speedups[best_i]:.2f}x at {n_cores(cores[best_i])}), "
+               "so the extra cores bought little.")
+    more = [f"{n_cores(c)} {s:.2f}x" for c, s in zip(cores, speedups) if c > rec]
+    if more:
+        why += " Speedup with more cores: " + ", ".join(more) + "."
+    st.write(why)
+    st.write("Parallel efficiency (speedup divided by cores): " + ", ".join(
+        f"{n_cores(c)} {s / c:.0%}" for c, s in zip(cores, speedups)) + ".")
+    st.caption(
+        "Not general Spark guidance. It comes from one run per core count, "
+        "with this dataset, on this machine's cores (which may mix "
+        "performance and efficiency cores). It compares Spark runs with each "
+        "other only, and does not say whether Spark is faster than a single "
+        "machine without Spark.")
+
+
 def show_results(res):
     runs = res["runs"]
     t1 = runs[0]["sec_per_iter_warm"]
@@ -134,6 +173,8 @@ def show_results(res):
             "Parallel efficiency": st.column_config.NumberColumn(format="percent"),
         },
     )
+
+    show_recommended_cores(table)
 
     if res["rows"] < SMALL_DATA_ROWS:
         st.info(
@@ -239,7 +280,7 @@ if summary["likely_id_columns"]:
 c1, c2 = st.columns(2)
 with c1:
     max_cores = st.select_slider("Max cores", options=list(range(1, MAX_CORES + 1)),
-                                 value=min(4, MAX_CORES))
+                                 value=min(8, MAX_CORES))
 with c2:
     iters = st.number_input("Iterations", min_value=5, max_value=500, value=30,
                             help="Gradient descent steps per run. The first "

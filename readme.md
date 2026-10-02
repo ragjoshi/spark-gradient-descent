@@ -177,11 +177,16 @@ Then open the URL it prints (usually http://localhost:8501) and:
 3. Choose the maximum core count and number of iterations, then click
    **Run benchmark**.
 
-The app runs `bench.py` once per core count (1, 2, 4, ... up to the maximum), each in
+The app runs `bench.py` once per core count (1, 2, 4, 8 by default, capped at the
+machine's core count and the 8 fixed partitions), each in
 its own process so every run gets a fresh `SparkContext`. It then shows:
 
 - **Speedup vs 1 core**, actual against ideal linear speedup
 - **Seconds per iteration** and parallel efficiency for each core count
+- **Recommended cores**: the smallest core count whose speedup is within 10% of the
+  best observed, labeled as a quick estimate for this dataset on this machine. It
+  compares Spark runs with each other only, so it is not general Spark guidance and
+  does not say whether Spark beats a single machine without Spark
 - **Correctness**: whether the Spark weights match the same gradient descent run in
   plain NumPy on one machine (datasets up to 200,000 rows), and cosine similarity
   against scikit-learn. On linearly separable data scikit-learn's unregularized
