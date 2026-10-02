@@ -2,10 +2,16 @@
 #
 # Usage:
 #   python numpy_baseline.py [--data FILE] [--iters N] [--threads T]
+#   python numpy_baseline.py --npy PREFIX [--stream] [--chunk-mb MB] [--iters N]
 #
-# Loads the HIGGS layout (no header, label in column 0) into memory,
-# standardizes it like train.standardize, and times each iteration of
-# w -= lr * X.T @ (sigmoid(X @ w) - y) / n. This is the bar Spark has to beat.
+# --data loads a HIGGS-layout CSV (no header, label in column 0) into memory
+# and standardizes it like train.standardize. --npy reads the output of
+# make_big_data.py (PREFIX.X.npy, PREFIX.y.npy) instead: loaded whole into RAM by default, or with
+# --stream read from disk in chunks on every iteration, which is what one
+# machine has to do when the data is larger than its memory.
+#
+# Each iteration computes w -= lr * X.T @ (sigmoid(X @ w) - y) / n and is
+# timed. This is the bar Spark has to beat.
 #
 # --threads caps the BLAS thread pool (default: the library's own choice,
 # usually every core). Use --threads 1 for a strictly single-core number.
@@ -18,6 +24,10 @@ import time
 
 p = argparse.ArgumentParser(description="Single-machine NumPy baseline.")
 p.add_argument("--data", default="higgs_1m.csv")
+p.add_argument("--npy", help="output prefix of make_big_data.py (used instead of --data)")
+p.add_argument("--stream", action="store_true",
+               help="with --npy: re-read the file from disk in chunks every iteration")
+p.add_argument("--chunk-mb", type=int, default=256)
 p.add_argument("--iters", type=int, default=50)
 p.add_argument("--threads", type=int)
 args = p.parse_args()
@@ -29,41 +39,76 @@ if args.threads is not None:
         os.environ[var] = str(args.threads)
 
 import numpy as np
-import pandas as pd
-
-from gradient import sigmoid
 
 LR = 0.5
 
+
+def sigmoid(z):
+    # Same formula as gradient.sigmoid, copied so this baseline runs without
+    # PySpark installed (gradient.py imports it).
+    return 1 / (1 + np.exp(-z))
+
+
+def load_csv(path):
+    import pandas as pd
+    raw = pd.read_csv(path, header=None, dtype=np.float64).to_numpy()
+    y = raw[:, 0]
+    feats = raw[:, 1:]
+    mean = feats.mean(axis=0)
+    std = feats.std(axis=0)
+    std = np.where(std < 1e-12, 1.0, std)
+    X = np.hstack([np.ones((len(y), 1)), (feats - mean) / std])
+    return [(y, X)]
+
+
+def npy_chunks(y, X, chunk_mb):
+    """(y, X) pairs over consecutive row ranges, read from disk if X is a memmap."""
+    rows = max(1, chunk_mb * 2**20 // (X.shape[1] * 8))
+    for a in range(0, X.shape[0], rows):
+        yield y[a:a + rows], np.asarray(X[a:a + rows])
+
+
 t0 = time.perf_counter()
-raw = pd.read_csv(args.data, header=None, dtype=np.float64).to_numpy()
+if args.npy:
+    # Labels are 1/30 of the data; keep them in memory either way.
+    y_all = np.load(f"{args.npy}.y.npy")
+    X_all = np.load(f"{args.npy}.X.npy", mmap_mode="r" if args.stream else None)
+    source = "npy-stream" if args.stream else "npy-memory"
+    blocks = [(y_all, X_all)]
+    chunks = ((lambda: npy_chunks(y_all, X_all, args.chunk_mb)) if args.stream
+              else (lambda: blocks))
+else:
+    source = "csv-memory"
+    blocks = load_csv(args.data)
+    chunks = lambda: blocks
 load_s = time.perf_counter() - t0
 
-y = raw[:, 0]
-feats = raw[:, 1:]
-mean = feats.mean(axis=0)
-std = feats.std(axis=0)
-std = np.where(std < 1e-12, 1.0, std)
-X = np.hstack([np.ones((len(y), 1)), (feats - mean) / std])
-del raw, feats
-n, d = X.shape
+n, d = blocks[0][1].shape
 
 w = np.zeros(d)
 per_iter = []
 for _ in range(args.iters):
     t = time.perf_counter()
-    z = X @ w
-    grad = X.T @ (sigmoid(z) - y) / n
-    loss = np.mean(np.maximum(z, 0.0) - z * y + np.log1p(np.exp(-np.abs(z))))
-    w = w - LR * grad
+    g = np.zeros(d)
+    loss_sum = 0.0
+    for y, X in chunks():
+        z = X @ w
+        g += X.T @ (sigmoid(z) - y)
+        loss_sum += np.sum(np.maximum(z, 0.0) - z * y + np.log1p(np.exp(-np.abs(z))))
+    loss = loss_sum / n
+    w = w - LR * g / n
     per_iter.append(time.perf_counter() - t)
+    print(f"iter {len(per_iter) - 1:3d}   loss = {loss:.6f}   ({per_iter[-1]:.3f}s)",
+          flush=True)
 
 warm = per_iter[1:] if len(per_iter) > 1 else per_iter
 out = {
-    "records": n, "features": d - 1, "iters": len(per_iter),
+    "source": source, "records": n, "features": d - 1, "iters": len(per_iter),
     "threads": args.threads, "load_s": load_s,
+    "gb": n * (d + 1) * 8 / 1e9,
     "sec_per_iter_warm": statistics.median(warm), "final_loss": float(loss),
+    "per_iter": per_iter,
 }
-print(f"records = {n:,}   load = {load_s:.2f}s   "
+print(f"{source}: records = {n:,}   load = {load_s:.2f}s   "
       f"sec/iter (warm) = {out['sec_per_iter_warm']:.4f}   loss = {loss:.6f}")
 print(json.dumps(out))

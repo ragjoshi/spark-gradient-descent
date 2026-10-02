@@ -15,18 +15,28 @@ from sklearn.metrics import log_loss, accuracy_score
 from gradient import sigmoid
 
 
+BLAS_THREAD_VARS = ("OPENBLAS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
+                    "OMP_NUM_THREADS", "MKL_NUM_THREADS")
+
+
 def make_context(cores, app_name):
-    # Python workers inherit this process's environment. One BLAS thread per
-    # worker keeps N workers on N cores; otherwise each X @ w in "blocks" mode
-    # would spawn its own thread pool and oversubscribe the machine. The
-    # driver's NumPy is already loaded, so its thread count is unaffected.
-    for var in ("OPENBLAS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
-                "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    """
+    cores=N:    local[N] on this machine.
+    cores=None: no master set here; spark-submit chooses it (e.g. YARN on EMR).
+    """
+    # One BLAS thread per Python worker keeps N workers on N cores; otherwise
+    # each X @ w in "blocks" mode would spawn its own thread pool and
+    # oversubscribe the machine. Local workers inherit this process's
+    # environment; executors on a cluster get it from spark.executorEnv.
+    # The driver's NumPy is already loaded, so its thread count is unaffected.
+    conf = SparkConf().setAppName(app_name)
+    for var in BLAS_THREAD_VARS:
         os.environ[var] = "1"
+        conf.set(f"spark.executorEnv.{var}", "1")
+    if cores is not None:
+        conf.setMaster(f"local[{cores}]")
     # spark.log.level applies from JVM startup; setLogLevel covers older Sparks.
-    conf = SparkConf().setMaster(f"local[{cores}]").setAppName(app_name) \
-                      .set("spark.log.level", "WARN") \
-                      .set("spark.ui.showConsoleProgress", "false")
+    conf.set("spark.log.level", "WARN").set("spark.ui.showConsoleProgress", "false")
     sc = SparkContext(conf=conf)
     sc.setLogLevel("WARN")
     return sc
@@ -38,7 +48,7 @@ def _first_line(path):
         return next(csv.reader(f))
 
 
-def load_csv(sc, path, label_col=None, n_parts=8):
+def load_csv(sc, path, label_col=None, n_parts=8, shuffle=True):
     """
     Load a numeric CSV as an RDD of (label, feature_vector) pairs.
 
@@ -47,8 +57,16 @@ def load_csv(sc, path, label_col=None, n_parts=8):
 
     Every non-header value must parse as a float; run preprocess.clean_csv
     first on untrusted files. Returns (rdd, d_feat).
+
+    path can be a local file or anything sc.textFile reads (s3://, hdfs://,
+    a directory of CSVs). shuffle=True evens out partitions with repartition;
+    shuffle=False uses coalesce, which only merges input splits and avoids
+    shuffling the whole dataset (for inputs far larger than n_parts splits).
     """
-    first = _first_line(path)
+    if "://" in path:
+        first = next(csv.reader([sc.textFile(path).first()]))
+    else:
+        first = _first_line(path)
     d_feat = len(first) - 1
 
     if label_col is None:
@@ -68,7 +86,9 @@ def load_csv(sc, path, label_col=None, n_parts=8):
     if label_col is not None:
         lines = lines.mapPartitionsWithIndex(
             lambda i, it: itertools.islice(it, 1, None) if i == 0 else it)
-    return lines.map(parse).repartition(n_parts), d_feat
+    rows = lines.map(parse)
+    rows = rows.repartition(n_parts) if shuffle else rows.coalesce(n_parts)
+    return rows, d_feat
 
 
 def load_higgs(sc, path, n_parts=8):
@@ -130,6 +150,14 @@ def _block_loss_sum(z, y):
     return float(np.sum(np.maximum(z, 0.0) - z * y + np.log1p(np.exp(-np.abs(z)))))
 
 
+def _cached_fraction(sc, rdd):
+    """Share of rdd's partitions held in the block manager's cache."""
+    for info in sc._jsc.sc().getRDDStorageInfo():
+        if info.id() == rdd.id():
+            return info.numCachedPartitions() / info.numPartitions()
+    return 0.0
+
+
 def train(sc, data, d, lr=0.5, max_iter=200, tol=1e-6, verbose=True, mode="rows"):
     """
     Batch gradient descent. mode="rows" computes the gradient one row at a
@@ -147,6 +175,7 @@ def train(sc, data, d, lr=0.5, max_iter=200, tol=1e-6, verbose=True, mode="rows"
         data = data.cache()
         n = data.count()                  # materializes cache -> loop timing is "warm"
     n_parts = data.getNumPartitions()     # actual partition count, for the scaling log
+    cached = _cached_fraction(sc, data)   # < 1.0: partitions are recomputed every iteration
     cores = sc.defaultParallelism         # = N in local[N]
     w = np.zeros(d)
     prev_loss = float("inf")
@@ -205,6 +234,7 @@ def train(sc, data, d, lr=0.5, max_iter=200, tol=1e-6, verbose=True, mode="rows"
     stats = {
         "mode": mode,
         "cores": cores, "records": n, "partitions": n_parts, "iters": iters,
+        "cached_fraction": cached, "final_loss": float(loss),
         "total_s": total,
         "sec_per_iter": total / iters,
         "sec_per_iter_warm": statistics.median(warm),
@@ -217,6 +247,7 @@ def train(sc, data, d, lr=0.5, max_iter=200, tol=1e-6, verbose=True, mode="rows"
         print(f"cores (local[N])   = {cores}")
         print(f"records            = {n:,}")
         print(f"partitions         = {n_parts}")
+        print(f"cached in memory   = {cached:.0%}")
         print(f"iterations run     = {iters}")
         print(f"total train time   = {total:.2f} s")
         print(f"sec / iteration    = {stats['sec_per_iter']:.4f}")

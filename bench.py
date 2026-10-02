@@ -11,6 +11,11 @@
 # --mode blocks packs each partition into a NumPy matrix (see train.to_blocks).
 # HIGGS runs in blocks mode go to results_blocks.csv instead of results.csv.
 #
+# --cluster runs under spark-submit on a real cluster (deploy/bigdata/):
+# spark-submit picks the master, <cores> is only a label, --data may be an
+# s3:// path or directory, and partitions are formed with coalesce instead
+# of a full repartition shuffle.
+#
 # The last line of stdout is always one JSON object, for app.py to parse:
 # the run's timing (plus correctness checks with --check), or {"error": ...}.
 import argparse
@@ -31,10 +36,10 @@ HIGGS = "higgs_1m.csv"
 
 
 def run_once(cores, rep, path=HIGGS, label_col=None, iters=MAX_ITER,
-             n_parts=N_PARTS, check=False, mode="rows"):
-    sc = make_context(cores, f"bench-{cores}c-r{rep}")
+             n_parts=N_PARTS, check=False, mode="rows", cluster=False):
+    sc = make_context(None if cluster else cores, f"bench-{cores}c-r{rep}")
     try:
-        raw, d_feat = load_csv(sc, path, label_col, n_parts)
+        raw, d_feat = load_csv(sc, path, label_col, n_parts, shuffle=not cluster)
         data = standardize(sc, raw, d_feat=d_feat)
 
         w, stats = train(sc, data, d_feat + 1, lr=LR,
@@ -76,6 +81,8 @@ def main():
                    help="also run the scikit-learn and NumPy correctness checks")
     p.add_argument("--mode", choices=["rows", "blocks"], default="rows",
                    help="row-at-a-time Python gradient, or one NumPy matrix per partition")
+    p.add_argument("--cluster", action="store_true",
+                   help="running under spark-submit on a cluster; see deploy/bigdata/")
     args = p.parse_args()
 
     # The HIGGS default keeps its original behavior: no preprocessing,
@@ -86,7 +93,7 @@ def main():
     out = {"cores": args.cores, "rep": args.rep}
 
     try:
-        if not os.path.exists(path):
+        if "://" not in path and not os.path.exists(path):
             print(json.dumps({"error": f"File not found: {path}", "kind": "data"}))
             return 2
 
@@ -101,7 +108,8 @@ def main():
             path = cleaned
 
         stats = run_once(args.cores, args.rep, path, args.label,
-                         args.iters, args.parts, args.check, args.mode)
+                         args.iters, args.parts, args.check, args.mode,
+                         args.cluster)
         out.update(stats)
 
         if default_run:
