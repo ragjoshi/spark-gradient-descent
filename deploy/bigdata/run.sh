@@ -126,9 +126,9 @@ prepare() {   # bucket, code, input data, and the run's meta.json
   if [ -n "$DATA" ] && [ "${DATA#s3://}" = "$DATA" ]; then
     echo "uploading $DATA to s3://$BUCKET/input/$NAME/ ..."
     if [ -d "$DATA" ]; then
-      aws s3 sync "$DATA" "s3://$BUCKET/input/$NAME/"
+      aws s3 sync --only-show-errors "$DATA" "s3://$BUCKET/input/$NAME/"
     else
-      aws s3 sync "$(dirname "$DATA")" "s3://$BUCKET/input/$NAME/" --exclude "*" --include "$base"
+      aws s3 sync --only-show-errors "$(dirname "$DATA")" "s3://$BUCKET/input/$NAME/" --exclude "*" --include "$base"
     fi
   fi
   # Data that is already in S3 is ready now; HIGGS is ready once the cluster
@@ -242,7 +242,14 @@ status() {
 results() {
   local out=$HERE/results
   mkdir -p "$out"
-  aws s3 cp --quiet --recursive "s3://$BUCKET/results/" "$out" --exclude "*/logs/*" --exclude "*/READY"
+  # One folder per run. Loose files at the top of results/ (from before runs
+  # had folders) are left alone; their copy is in results/higgs10x/.
+  local run
+  for run in $(aws s3 ls "s3://$BUCKET/results/" | awk '$1 == "PRE" {print $2}' | tr -d /); do
+    [ "$run" = logs ] && continue
+    aws s3 cp --quiet --recursive "s3://$BUCKET/results/$run/" "$out/$run/" \
+      --exclude "logs/*" --exclude "READY"
+  done
   python3 - "$out" <<'EOF'
 import json, os, statistics, sys
 from collections import defaultdict
