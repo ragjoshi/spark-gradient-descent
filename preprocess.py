@@ -82,7 +82,8 @@ def clean_csv(src, label_col, dst):
     (train.standardize).
 
     Returns a summary dict: rows_in, rows_dropped, rows, n_features,
-    features, ignored_columns.
+    features, ignored_columns, likely_id_columns (features that look like
+    row numbers; kept, but worth removing).
     """
     df, ignored = _read(src)
     problems = []
@@ -132,6 +133,16 @@ def clean_csv(src, label_col, dst):
 
     df.astype(np.float64).to_csv(dst, index=False)
 
+    # Whole numbers, all distinct, forming one gapless run (0..n-1, 1..n,
+    # 1001..1000+n): almost certainly a row ID, which carries no signal.
+    # Reported, not dropped, since a real feature could look like this.
+    likely_ids = []
+    for c in features:
+        v = df[c]
+        if (v == np.floor(v)).all() and v.is_unique and \
+                v.max() - v.min() + 1 == len(v) and len(v) > 2:
+            likely_ids.append(c)
+
     return {
         "rows_in": rows_in,
         "rows_dropped": rows_dropped,
@@ -139,4 +150,5 @@ def clean_csv(src, label_col, dst):
         "n_features": len(features),
         "features": features,
         "ignored_columns": ignored,
+        "likely_id_columns": likely_ids,
     }
