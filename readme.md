@@ -99,6 +99,45 @@ compute-bound Amdahl system, but one where fixed overhead is a larger relative s
 low core counts. The honest headline is therefore **~90% parallel efficiency**, with
 the serial fraction cited as an estimated single-digit-percent range.
 
+## Spark vs. plain NumPy
+
+The scaling numbers above say how Spark compares with *itself* on fewer cores. The
+more important question is how it compares with no Spark at all. `numpy_baseline.py`
+runs the same gradient descent on one machine in plain NumPy:
+
+| Version (1M HIGGS rows, M2 MacBook Pro) | Best s/iter | vs. NumPy |
+|---|--:|--:|
+| Plain NumPy, one process (`numpy_baseline.py`) | 0.030 | 1× |
+| Spark, `--mode blocks`, 4 cores | 0.326 | ~11× slower |
+| Spark, `--mode rows` (original), 4 cores | 0.889 | ~30× slower |
+
+`--mode rows` runs the gradient one row at a time in Python, so each task pickles and
+loops over 125,000 tuples. `--mode blocks` (`train.to_blocks`) packs each partition into
+NumPy matrices once, so the gradient is one `X @ w` per block. That is 3.8× faster on
+1 core (0.825 vs. 3.10 s/iter) and gives the same weights to ~1e-16.
+
+Blocks mode, median of 3 interleaved reps:
+
+| Cores | Median s/iter | Speedup |
+|------:|--------------:|--------:|
+| 1     | 0.825         | 1.00×   |
+| 2     | 0.486         | 1.70×   |
+| 4     | 0.326         | 2.53×   |
+| 8     | 0.454         | noisy (0.30–0.63); the M2 has 4 performance + 4 efficiency cores |
+
+Blocks mode scales worse than rows mode because there is less work left to
+parallelize. What remains is mostly **fixed per-iteration overhead**. The same job on
+a 20,000-row file still takes 0.26 s/iter on 4 cores, so roughly 80% of the 0.326 s is
+coordination, not math. Most of it is a ~50 ms stall per Python task in PySpark 4.1:
+the JVM-side Python runner and the worker each wait on the other before a task starts.
+A job that runs entirely in the JVM costs ~5 ms per task; a Python task costs ~50 ms,
+even with a Unix domain socket instead of TCP.
+
+So on data that fits in one machine's RAM, NumPy wins: it reads 230 MB from memory in
+30 ms, which is less than Spark's fixed cost for a single iteration. Spark's overhead
+only becomes negligible when each iteration has much more data to process than one
+machine can hold in memory.
+
 ## Repository structure
 
 ```
@@ -107,6 +146,7 @@ spark-project/
 ├── train.py         # Training driver: CSV loader, distributed GD loop, correctness checks
 ├── preprocess.py    # Validates and cleans uploaded CSVs with readable errors
 ├── bench.py         # Strong-scaling benchmark harness (one run per process, JSON output)
+├── numpy_baseline.py # The same gradient descent in plain NumPy on one machine
 ├── app.py           # Streamlit front end: upload a CSV, run the scaling benchmark
 ├── analyze.py       # Computes speedup / efficiency / serial fraction from results.csv
 ├── requirements.txt # Pinned Python dependencies
@@ -143,14 +183,17 @@ label column instead:
 python bench.py 4 0 --data mydata.csv --label target --iters 30 --check
 ```
 
-Custom-data runs never write to `results.csv`. `--check` adds the correctness checks
+Add `--mode blocks` to any run to use the vectorized gradient (one NumPy matrix per
+block instead of one Python row at a time); HIGGS runs in that mode append to
+`results_blocks.csv`. Custom-data runs never write to `results.csv`. `--check` adds the correctness checks
 (scikit-learn cosine similarity, and an exact comparison against the same gradient
 descent run in plain NumPy). The last line of output is always a JSON object.
 
 `train.py` is imported by `bench.py` (it exposes the loader, standardizer, and training
 loop). It can also be run directly for a single 200-iteration training run with full
 diagnostics: `python train.py` for HIGGS, or `python train.py mydata.csv target`.
-Once results are collected, compute the speedup / efficiency / serial-fraction table
+For the single-machine baseline, run `python numpy_baseline.py` (`--threads 1` to
+cap NumPy at one core). Once results are collected, compute the speedup / efficiency / serial-fraction table
 with:
 
 ```bash

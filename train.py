@@ -16,6 +16,13 @@ from gradient import sigmoid
 
 
 def make_context(cores, app_name):
+    # Python workers inherit this process's environment. One BLAS thread per
+    # worker keeps N workers on N cores; otherwise each X @ w in "blocks" mode
+    # would spawn its own thread pool and oversubscribe the machine. The
+    # driver's NumPy is already loaded, so its thread count is unaffected.
+    for var in ("OPENBLAS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
+                "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ[var] = "1"
     # spark.log.level applies from JVM startup; setLogLevel covers older Sparks.
     conf = SparkConf().setMaster(f"local[{cores}]").setAppName(app_name) \
                       .set("spark.log.level", "WARN") \
@@ -97,9 +104,48 @@ def standardize(sc, data, d_feat):
     return data.map(transform)
 
 
-def train(sc, data, d, lr=0.5, max_iter=200, tol=1e-6, verbose=True):
-    data = data.cache()
-    n = data.count()                      # materializes cache -> loop timing is "warm"
+def to_blocks(data, block_rows=16_384):
+    """
+    Pack each partition's (label, vector) rows into (y, X) pairs of NumPy
+    arrays: y is (k,), X is (k, d), with k <= block_rows.
+
+    Each task then deserializes a few arrays instead of one Python tuple per
+    row, and the gradient is a matrix product instead of a Python loop.
+    Blocks are capped in size (16,384 rows x 29 columns is about 4 MB) rather
+    than one per partition: with 8 workers each sending a 30 MB block at
+    once, macOS runs out of socket buffer space ("No buffer space available").
+    """
+    def pack(rows):
+        while True:
+            chunk = list(itertools.islice(rows, block_rows))
+            if not chunk:
+                return
+            yield (np.array([r[0] for r in chunk]), np.vstack([r[1] for r in chunk]))
+
+    return data.mapPartitions(pack, preservesPartitioning=True)
+
+
+def _block_loss_sum(z, y):
+    # Same numerically stable log-loss as the row version, summed over a block.
+    return float(np.sum(np.maximum(z, 0.0) - z * y + np.log1p(np.exp(-np.abs(z)))))
+
+
+def train(sc, data, d, lr=0.5, max_iter=200, tol=1e-6, verbose=True, mode="rows"):
+    """
+    Batch gradient descent. mode="rows" computes the gradient one row at a
+    time in Python (the original version); mode="blocks" packs each partition
+    into a NumPy matrix first and computes it with one X @ w per partition.
+    Both produce the same weights up to floating-point summation order.
+    """
+    if mode not in ("rows", "blocks"):
+        raise ValueError(f"mode must be 'rows' or 'blocks', not {mode!r}")
+    if mode == "blocks":
+        data = to_blocks(data).cache()
+        data.count()                      # materializes cache -> loop timing is "warm"
+        n = data.map(lambda b: len(b[0])).sum()
+    else:
+        data = data.cache()
+        n = data.count()                  # materializes cache -> loop timing is "warm"
     n_parts = data.getNumPartitions()     # actual partition count, for the scaling log
     cores = sc.defaultParallelism         # = N in local[N]
     w = np.zeros(d)
@@ -119,6 +165,16 @@ def train(sc, data, d, lr=0.5, max_iter=200, tol=1e-6, verbose=True):
             g = g + (sigmoid(z) - y) * x
             loss += max(z, 0.0) - z * y + np.log1p(np.exp(-abs(z)))
             return (g, loss, c + 1)
+
+        def seq_op_block(acc, block):
+            g, loss, c = acc
+            y, X = block
+            z = X @ w_bc.value
+            return (g + X.T @ (sigmoid(z) - y), loss + _block_loss_sum(z, y),
+                    c + len(y))
+
+        if mode == "blocks":
+            seq_op = seq_op_block
 
         def comb_op(a, b):
             return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
@@ -147,6 +203,7 @@ def train(sc, data, d, lr=0.5, max_iter=200, tol=1e-6, verbose=True):
     
 
     stats = {
+        "mode": mode,
         "cores": cores, "records": n, "partitions": n_parts, "iters": iters,
         "total_s": total,
         "sec_per_iter": total / iters,
@@ -156,6 +213,7 @@ def train(sc, data, d, lr=0.5, max_iter=200, tol=1e-6, verbose=True):
 
     if verbose: 
         print("\n--- timing ---")
+        print(f"mode               = {mode}")
         print(f"cores (local[N])   = {cores}")
         print(f"records            = {n:,}")
         print(f"partitions         = {n_parts}")
