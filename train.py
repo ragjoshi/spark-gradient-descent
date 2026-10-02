@@ -269,6 +269,7 @@ if __name__ == "__main__":
         try:
             summary = clean_csv(path, label_col, cleaned)
         except DataError as e:
+            os.remove(cleaned)
             sys.exit(f"error: {e}")
         print(f"rows used = {summary['rows']:,}  "
               f"(dropped {summary['rows_dropped']:,} with missing values)")
