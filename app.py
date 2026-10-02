@@ -4,6 +4,7 @@
 #
 # Each core count runs bench.py in its own subprocess, so every run gets a
 # fresh SparkContext (local[N] cannot be resized inside one JVM).
+import hmac
 import json
 import os
 import subprocess
@@ -223,7 +224,22 @@ def show_results(res):
             "converged yet. Try more iterations.")
 
 
+def require_password():
+    """Gate the page when APP_PASSWORD is set (e.g. on a public server)."""
+    expected = os.environ.get("APP_PASSWORD")
+    if not expected or st.session_state.get("authed"):
+        return
+    pw = st.text_input("Password", type="password")
+    if pw and hmac.compare_digest(pw, expected):
+        st.session_state.authed = True
+        st.rerun()
+    if pw:
+        st.error("Wrong password.")
+    st.stop()
+
+
 st.set_page_config(page_title="Spark Scaling Lab", layout="wide")
+require_password()
 st.title("Spark Scaling Lab")
 st.write(
     "Upload a CSV and see how distributed logistic regression speeds up as "

@@ -110,6 +110,8 @@ spark-project/
 ├── app.py           # Streamlit front end: upload a CSV, run the scaling benchmark
 ├── analyze.py       # Computes speedup / efficiency / serial fraction from results.csv
 ├── requirements.txt # Pinned Python dependencies
+├── Dockerfile       # Container image for the app (Python 3.12 + Java 21)
+├── deploy/          # EC2 user data + deploy script (see Deploying to AWS)
 ├── results.csv      # Clean benchmark results (9 runs: 1/2/4 cores × 3 reps)
 ├── results_raw.csv  # Unfiltered measurement log (includes caught contamination)
 └── higgs_1m.csv     # 1M-row HIGGS subset (28 features + label) — not committed
@@ -208,6 +210,41 @@ Things to know:
   with a header row is about 700 MB.
 - Restart the app after editing `train.py` or `preprocess.py`; Streamlit does not
   reload imported modules.
+
+## Deploying to AWS
+
+To use the app from other machines, run it on an EC2 instance. The app runs in
+Docker (`Dockerfile`: Python 3.12 + Java 21), and Spark still uses `local[N]` on
+that one instance.
+
+1. **Launch an instance** in the EC2 console:
+   - AMI: Amazon Linux 2023 (x86_64).
+   - Type: `c7a.2xlarge` (8 vCPUs, 16 GB, about $0.41/hour). On AMD `c7a`, each
+     vCPU is a full physical core, so 1→8 cores is a fair scaling test. On Intel
+     types like `c7i`, 8 vCPUs are only 4 physical cores with hyperthreading.
+   - Storage: 30 GB (Docker image plus uploads of up to 1 GB each).
+   - Key pair: create or choose one and keep the `.pem` file.
+   - Security group: SSH (22) from **My IP**, and HTTP (80) from the IPs of the
+     machines you will test from. Use "Anywhere" only together with `APP_PASSWORD`.
+   - Advanced details → User data: paste the contents of `deploy/user-data.sh`
+     (it installs Docker).
+2. **Deploy** from this folder, about a minute after the instance starts:
+   ```bash
+   APP_PASSWORD=choose-a-password deploy/deploy.sh <instance-public-ip> ~/path/to/key.pem
+   ```
+   This copies the project with rsync, builds the image on the instance, and starts
+   the container on port 80, set to restart if it stops. Run the same command again
+   to redeploy after code changes. Leave out `APP_PASSWORD` to skip the password page.
+3. Open `http://<instance-public-ip>` on any machine.
+
+Notes:
+
+- Only one benchmark runs at a time across all users, so concurrent runs can't
+  distort each other's timings. Others see a "wait" message.
+- The site is plain HTTP, so the password and uploads are not encrypted. Keep the
+  security group restricted to your IPs.
+- Uploads stay in the container's `/tmp` until the next redeploy.
+- **Stop the instance** when you're done. It is billed by the hour while running.
 
 ## Notes
 
