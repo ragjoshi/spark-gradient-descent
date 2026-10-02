@@ -313,6 +313,32 @@ deploy/bigdata/run.sh results   # download and compare
 deploy/bigdata/run.sh down      # stop anything still running
 ```
 
+### Results (October 2026, us-east-1)
+
+Same data in every row: 110M rows, 26.4 GB as float64. Raw JSON is in
+`deploy/bigdata/results/`.
+
+| Setup | s/iter | vs. Spark on 4 nodes | Final loss |
+|---|--:|--:|--:|
+| Spark, 4 × r5.2xlarge (32 cores, data cached) | **2.73** | 1× | 0.650322 |
+| Spark, 2 × r5.2xlarge (16 cores, data cached) | 5.31 | 1.9× slower | 0.650322 |
+| NumPy, 1 × r6id.2xlarge (64 GB, data in RAM) | 5.53 | 2.0× slower | 0.650322 |
+| NumPy, 1 × m6id.xlarge (16 GB, re-reads from NVMe) | 80.93 | 30× slower | 0.668668 (6 iters) |
+
+- **Spark wins once the data no longer fits on one machine.** The 16 GB machine
+  spends every iteration re-reading 26 GB from disk (~0.33 GB/s); the cluster
+  keeps it all in memory and is 30× faster.
+- **Scaling across machines is nearly linear:** 2 → 4 nodes is 1.95× faster, and
+  both repetitions agreed to within 1%.
+- **One big machine is the real competitor.** A single 64 GB machine running NumPy
+  matches 2 Spark nodes. Spark only pulls ahead with more nodes, and that machine
+  had a newer CPU than the r5 cluster nodes.
+- **Same answer everywhere:** after 20 iterations the loss agrees to 13 decimal
+  places (the 16 GB run did 6 iterations; it matches the 64 GB run's 6th, 0.668668).
+
+Combined with the laptop numbers above: on 1M rows NumPy is 11× faster than
+Spark; on 110M rows that don't fit in one machine's memory, Spark is 30× faster.
+
 Every machine terminates itself when its benchmark finishes (hard caps: 3 h
 for the cluster's step, 2.5 h for the NumPy instances). The data stays in S3
 until you delete the bucket; `down` prints the command.
