@@ -4,14 +4,17 @@
 #
 # Each core count runs bench.py in its own subprocess, so every run gets a
 # fresh SparkContext (local[N] cannot be resized inside one JVM).
+import glob
 import hmac
 import json
+import statistics
 import os
 import subprocess
 import sys
 import tempfile
 import threading
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -19,6 +22,11 @@ from preprocess import DataError, clean_csv, read_header
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BENCH = os.path.join(HERE, "bench.py")
+NUMPY = os.path.join(HERE, "numpy_baseline.py")
+HIGGS = os.path.join(HERE, "higgs_1m.csv")          # no header, label in column 0
+RECORDED = os.path.join(HERE, "deploy", "bigdata", "results")
+MODES = {"Vectorized (one NumPy matrix per block)": "blocks",
+         "Row by row (original)": "rows"}
 MAX_CORES = min(os.cpu_count() or 1, 8)   # partitions are fixed at 8
 SMALL_DATA_ROWS = 100_000
 LABEL_GUESSES = ["label", "target", "y", "class", "outcome"]
@@ -72,13 +80,27 @@ def save_upload(uploaded):
     return path
 
 
-def run_bench(cores, path, label, iters, check):
+def run_bench(cores, path, label, iters, check, mode):
     cmd = [sys.executable, BENCH, str(cores), "0", "--data", path,
-           "--label", label, "--iters", str(iters)]
+           "--iters", str(iters), "--mode", mode]
+    if label is not None:
+        cmd += ["--label", label]
     if check:
         cmd.append("--check")
-    p = subprocess.run(cmd, cwd=HERE, env=spark_env(),
-                       capture_output=True, text=True)
+    return run_json(cmd, spark_env())
+
+
+def run_numpy(path, label, iters):
+    """The same gradient descent in plain NumPy, one process, no Spark."""
+    cmd = [sys.executable, NUMPY, "--data", path, "--iters", str(iters)]
+    if label is not None:
+        cmd += ["--label", label]
+    return run_json(cmd, dict(os.environ))
+
+
+def run_json(cmd, env):
+    """Run a script whose last stdout line is a JSON result."""
+    p = subprocess.run(cmd, cwd=HERE, env=env, capture_output=True, text=True)
     lines = p.stdout.strip().splitlines()
     try:
         out = json.loads(lines[-1])
@@ -131,8 +153,125 @@ def show_recommended_cores(table):
         "Not general Spark guidance. It comes from one run per core count, "
         "with this dataset, on this machine's cores (which may mix "
         "performance and efficiency cores). It compares Spark runs with each "
-        "other only, and does not say whether Spark is faster than a single "
-        "machine without Spark.")
+        "other only; see the NumPy comparison above for Spark vs. no Spark.")
+
+
+def comparison_chart(rows):
+    """Horizontal bars of seconds per iteration, in the given order.
+
+    rows: list of (name, seconds, kind) with kind "Spark" or "NumPy".
+    """
+    df = pd.DataFrame(rows, columns=["Setup", "Seconds per iteration", "Kind"])
+    df["Label"] = df["Seconds per iteration"].map(
+        lambda v: f"{v:.2f} s" if v >= 0.1 else f"{v:.3f} s")
+    base = alt.Chart(df).encode(
+        y=alt.Y("Setup:N", sort=None, title=None, axis=alt.Axis(labelLimit=400)),
+        x=alt.X("Seconds per iteration:Q", title="Seconds per iteration (lower is faster)"),
+    )
+    bars = base.mark_bar().encode(
+        color=alt.Color("Kind:N", scale=alt.Scale(domain=["Spark", "NumPy"],
+                                                  range=["#e25a1c", "#4c78a8"]),
+                        legend=alt.Legend(title=None, orient="top")))
+    text = base.mark_text(align="left", dx=4).encode(text="Label:N")
+    st.altair_chart((bars + text).properties(height=48 * len(df) + 40),
+                    use_container_width=True)
+
+
+def show_numpy_comparison(runs, numpy):
+    st.subheader("Spark vs. plain NumPy")
+    if "error" in numpy:
+        st.warning("The NumPy comparison failed: " + numpy["error"])
+        return
+    best = min(runs, key=lambda r: r["sec_per_iter_warm"])
+    spark_s, np_s = best["sec_per_iter_warm"], numpy["sec_per_iter_warm"]
+    rows = [(f"Spark, {r['cores']} core" + ("" if r["cores"] == 1 else "s"),
+             r["sec_per_iter_warm"], "Spark") for r in runs]
+    rows.append(("NumPy, 1 process", np_s, "NumPy"))
+    comparison_chart(rows)
+    if np_s < spark_s:
+        st.metric("Faster here", "NumPy",
+                  f"{spark_s / np_s:.1f}x faster than Spark's best "
+                  f"({best['cores']} cores)", delta_color="off")
+        st.write(
+            "On data that fits in one machine's memory, NumPy wins. Each Spark "
+            "iteration pays a fixed cost to schedule tasks and move data between "
+            "the JVM and Python workers, and on this data that cost is larger "
+            "than the math itself. Spark pays off when the data no longer fits "
+            "on one machine; see the **Recorded cluster run** tab.")
+    else:
+        st.metric("Faster here", "Spark",
+                  f"{np_s / spark_s:.1f}x faster than NumPy", delta_color="off")
+    st.caption("NumPy runs the same gradient descent (same data, starting point, "
+               "learning rate and iterations) in one process with no Spark, "
+               "timed the same way: median per-iteration time, iteration 0 "
+               "dropped, loading excluded. Its matrix library may use several "
+               f"cores. Final loss: Spark {best['final_loss']:.6f}, "
+               f"NumPy {numpy['final_loss']:.6f}.")
+
+
+def load_recorded():
+    """Results of deploy/bigdata/run.sh, grouped by setup name."""
+    runs = {}
+    for f in sorted(glob.glob(os.path.join(RECORDED, "*.json"))):
+        with open(f) as fh:
+            r = json.load(fh)
+        if "error" not in r:
+            runs.setdefault(os.path.basename(f).split("-r")[0].removesuffix(".json"),
+                            []).append(r)
+    return runs
+
+
+def show_recorded():
+    runs = load_recorded()
+    needed = ["spark-e4", "spark-e2", "numpy-64gb", "numpy-16gb"]
+    if not all(k in runs for k in needed):
+        st.info("No recorded cluster results found in deploy/bigdata/results/. "
+                "Run deploy/bigdata/run.sh to produce them.")
+        return
+    med = {k: statistics.median(r["sec_per_iter_warm"] for r in runs[k]) for k in needed}
+    rows_n = runs["spark-e4"][0]["records"]
+    gb = runs["numpy-64gb"][0]["gb"]
+
+    st.info(f"**Recorded, not live.** Measured on AWS on October 2, 2026; the "
+            f"full run takes about an hour. {rows_n / 1e6:.0f}M rows "
+            f"(10 copies of HIGGS), {gb:.1f} GB as float64: more than the 16 GB "
+            "machine's memory.")
+    comparison_chart([
+        ("Spark, 4 machines (32 cores)", med["spark-e4"], "Spark"),
+        ("Spark, 2 machines (16 cores)", med["spark-e2"], "Spark"),
+        ("NumPy, one 64 GB machine (data in RAM)", med["numpy-64gb"], "NumPy"),
+        ("NumPy, one 16 GB machine (re-reads from disk)", med["numpy-16gb"], "NumPy"),
+    ])
+    a, b, c = st.columns(3)
+    a.metric("Spark (4 machines) vs. NumPy on 16 GB",
+             f"{med['numpy-16gb'] / med['spark-e4']:.0f}x faster")
+    b.metric("Spark (4 machines) vs. NumPy on 64 GB",
+             f"{med['numpy-64gb'] / med['spark-e4']:.1f}x faster")
+    c.metric("Spark: 2 → 4 machines", f"{med['spark-e2'] / med['spark-e4']:.2f}x faster",
+             help="Perfect scaling would be 2.00x.")
+    st.write(
+        "- **The 16 GB machine** cannot hold the data, so every iteration re-reads "
+        "all of it from disk. The cluster keeps it in memory across 4 machines.\n"
+        "- **One big machine is the real competitor:** a 64 GB machine running "
+        "NumPy matches 2 Spark machines. Spark pulls ahead as machines are added.\n"
+        "- **Same answer everywhere:** every 20-iteration run ends at loss "
+        f"{runs['spark-e4'][0]['final_loss']:.6f}.")
+    st.dataframe(pd.DataFrame([
+        {"Setup": "Spark, 4 × r5.2xlarge", "Seconds per iteration": med["spark-e4"],
+         "Runs": len(runs["spark-e4"]), "Final loss": runs["spark-e4"][0]["final_loss"]},
+        {"Setup": "Spark, 2 × r5.2xlarge", "Seconds per iteration": med["spark-e2"],
+         "Runs": len(runs["spark-e2"]), "Final loss": runs["spark-e2"][0]["final_loss"]},
+        {"Setup": "NumPy, r6id.2xlarge (64 GB, in RAM)", "Seconds per iteration": med["numpy-64gb"],
+         "Runs": 1, "Final loss": runs["numpy-64gb"][0]["final_loss"]},
+        {"Setup": "NumPy, m6id.xlarge (16 GB, from NVMe)", "Seconds per iteration": med["numpy-16gb"],
+         "Runs": 1, "Final loss": runs["numpy-16gb"][0]["final_loss"]},
+    ]), hide_index=True, column_config={
+        "Seconds per iteration": st.column_config.NumberColumn(format="%.2f"),
+        "Final loss": st.column_config.NumberColumn(format="%.6f")})
+    st.caption("Spark runs on EMR with data cached in memory (100% of partitions). "
+               "The 16 GB NumPy run did 6 iterations instead of 20 (81 s each); "
+               "its loss after 6 matches the 64 GB run's 6th iteration (0.668668). "
+               "Raw results: deploy/bigdata/results/.")
 
 
 def show_results(res):
@@ -175,6 +314,9 @@ def show_results(res):
         },
     )
 
+    if res.get("numpy"):
+        show_numpy_comparison(runs, res["numpy"])
+
     show_recommended_cores(table)
 
     if res["rows"] < SMALL_DATA_ROWS:
@@ -200,6 +342,18 @@ def show_results(res):
             st.caption(f"Largest weight difference: {check['ref_max_abs_diff']:.1e}. "
                        "Differences near 1e-16 are floating-point rounding "
                        "from adding partition sums in a different order.")
+        elif res.get("numpy") and "error" not in res["numpy"]:
+            # Too many rows to copy the data into this process, but the
+            # separate NumPy run trained on the same data: compare its loss.
+            spark_loss, np_loss = check["final_loss"], res["numpy"]["final_loss"]
+            same = abs(spark_loss - np_loss) <= 1e-9 * max(1.0, abs(np_loss))
+            st.metric("Matches single-machine NumPy", "Yes" if same else "No",
+                      help="Final training loss of the Spark run vs. the "
+                           "separate plain-NumPy run on the same data, after "
+                           "the same number of iterations.")
+            st.caption(f"Final loss: Spark {spark_loss:.10f}, NumPy {np_loss:.10f}. "
+                       "Compared by loss because the data is too large to copy "
+                       "into this process for a weight-by-weight check.")
         else:
             st.metric("Matches single-machine NumPy", "Skipped")
             st.caption(f"Skipped: {check.get('ref_reason', 'not run')}.")
@@ -242,101 +396,134 @@ st.set_page_config(page_title="Spark Scaling Lab", layout="wide")
 require_password()
 st.title("Spark Scaling Lab")
 st.write(
-    "Upload a CSV and see how distributed logistic regression speeds up as "
-    "Spark gets more cores. Training is batch gradient descent written from "
-    "scratch on Spark's RDD API.")
+    "Distributed logistic regression, written from scratch on Spark's RDD API "
+    "(batch gradient descent, no MLlib). See how it speeds up as Spark gets "
+    "more cores, and how it compares with plain NumPy on one machine.")
 
-uploaded = st.file_uploader(
-    "CSV with a header row, numeric columns, and a 0/1 label column",
-    type=["csv", "tsv", "txt"])
-if uploaded is None:
-    st.stop()
+live, recorded = st.tabs(["Run on this machine", "Recorded cluster run (AWS, 110M rows)"])
 
-raw_path = save_upload(uploaded)
-try:
-    columns = read_header(raw_path)
-except DataError as e:
-    st.error(str(e))
-    st.stop()
+# The recorded tab is filled first: the live tab below calls st.stop() while
+# it waits for input, which would otherwise end the script before this runs.
+with recorded:
+    show_recorded()
 
-guess = next((c for c in columns if str(c).strip().lower() in LABEL_GUESSES),
-             columns[-1])
-label = st.selectbox("Label column (what to predict)", columns,
-                     index=columns.index(guess))
+with live:
+    sources = (["HIGGS sample (1M rows, built in)"] if os.path.exists(HIGGS) else [])
+    sources.append("Upload a CSV")
+    source = st.radio("Data", sources, horizontal=True)
 
-clean_path = os.path.join(session_dir(), "clean.csv")
-# Cleaning a large file takes seconds (about 20 s for 1M rows), and Streamlit
-# reruns this script on every widget change, so clean once per (file, label).
-clean_key = (st.session_state.upload_id, label)
-if st.session_state.get("clean_key") != clean_key:
-    with st.spinner("Checking the file..."):
+    if source.startswith("HIGGS"):
+        # Already numeric and clean: no header, label in column 0.
+        data_path, label, n_rows = HIGGS, None, 1_000_000
+        data_key = ("higgs",)
+        st.success("Ready: 1,000,000 rows of HIGGS; 28 features; label in column 0.")
+    else:
+        uploaded = st.file_uploader(
+            "CSV with a header row, numeric columns, and a 0/1 label column",
+            type=["csv", "tsv", "txt"])
+        if uploaded is None:
+            st.stop()
+
+        raw_path = save_upload(uploaded)
         try:
-            st.session_state.clean_result = clean_csv(raw_path, label, clean_path)
+            columns = read_header(raw_path)
         except DataError as e:
-            st.session_state.clean_result = DataError(str(e))
-    st.session_state.clean_key = clean_key
-summary = st.session_state.clean_result
-if isinstance(summary, DataError):
-    st.error(str(summary))
-    st.stop()
+            st.error(str(e))
+            st.stop()
 
-notes = [f"{summary['rows']:,} rows", f"{summary['n_features']} features"]
-if summary["rows_dropped"]:
-    notes.append(f"{summary['rows_dropped']:,} rows with missing values dropped")
-if summary["ignored_columns"]:
-    notes.append("ignored index column(s): " + ", ".join(summary["ignored_columns"]))
-st.success("Ready: " + "; ".join(notes) + ".")
-if summary["likely_id_columns"]:
-    st.warning(
-        "These columns look like row numbers (whole numbers counting up with "
-        "no gaps): " + ", ".join(summary["likely_id_columns"]) + ". They are "
-        "being used as features, which teaches the model nothing real. "
-        "Remove them from the file if they are IDs.")
+        guess = next((c for c in columns if str(c).strip().lower() in LABEL_GUESSES),
+                     columns[-1])
+        label = st.selectbox("Label column (what to predict)", columns,
+                             index=columns.index(guess))
 
-c1, c2 = st.columns(2)
-with c1:
-    max_cores = st.select_slider("Max cores", options=list(range(1, MAX_CORES + 1)),
-                                 value=min(8, MAX_CORES))
-with c2:
-    iters = st.number_input("Iterations", min_value=5, max_value=500, value=30,
-                            help="Gradient descent steps per run. The first "
-                                 "one is excluded from timing (JVM warmup).")
+        data_path = os.path.join(session_dir(), "clean.csv")
+        # Cleaning a large file takes seconds (about 20 s for 1M rows), and
+        # Streamlit reruns this script on every widget change, so clean once
+        # per (file, label).
+        clean_key = (st.session_state.upload_id, label)
+        if st.session_state.get("clean_key") != clean_key:
+            with st.spinner("Checking the file..."):
+                try:
+                    st.session_state.clean_result = clean_csv(raw_path, label, data_path)
+                except DataError as e:
+                    st.session_state.clean_result = DataError(str(e))
+            st.session_state.clean_key = clean_key
+        summary = st.session_state.clean_result
+        if isinstance(summary, DataError):
+            st.error(str(summary))
+            st.stop()
 
-counts = core_counts(max_cores)
-st.caption(f"Will run with {', '.join(map(str, counts))} core(s), one Spark "
-           "process each.")
+        notes = [f"{summary['rows']:,} rows", f"{summary['n_features']} features"]
+        if summary["rows_dropped"]:
+            notes.append(f"{summary['rows_dropped']:,} rows with missing values dropped")
+        if summary["ignored_columns"]:
+            notes.append("ignored index column(s): " + ", ".join(summary["ignored_columns"]))
+        st.success("Ready: " + "; ".join(notes) + ".")
+        if summary["likely_id_columns"]:
+            st.warning(
+                "These columns look like row numbers (whole numbers counting up "
+                "with no gaps): " + ", ".join(summary["likely_id_columns"]) + ". "
+                "They are being used as features, which teaches the model nothing "
+                "real. Remove them from the file if they are IDs.")
+        n_rows = summary["rows"]
+        data_key = ("upload", st.session_state.upload_id, label)
 
-if st.button("Run benchmark", type="primary"):
-    lock = run_lock()
-    if not lock.acquire(blocking=False):
-        st.warning("Another benchmark is running. Wait for it to finish, "
-                   "since overlapping runs would distort both timings.")
-        st.stop()
-    try:
-        st.session_state.pop("results", None)
-        runs, check = [], None
-        progress = st.progress(0.0)
-        for i, cores in enumerate(counts):
-            progress.progress(i / len(counts),
-                              text=f"Running with {cores} core(s) "
-                                   f"({i + 1} of {len(counts)})...")
-            # Correctness checks run once, on the last run, after its timed loop.
-            last = i == len(counts) - 1
-            result = run_bench(cores, clean_path, label, iters, check=last)
-            if "error" in result:
-                progress.empty()
-                show_error(result)
-                st.stop()
-            runs.append(result)
-            if last:
-                check = result
-        progress.empty()
-        st.session_state.results = {"runs": runs, "check": check,
-                                    "rows": summary["rows"],
-                                    "label": label, "iters": iters}
-    finally:
-        lock.release()
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        max_cores = st.select_slider("Max cores", options=list(range(1, MAX_CORES + 1)),
+                                     value=min(4, MAX_CORES))
+    with c2:
+        iters = st.number_input("Iterations", min_value=5, max_value=500, value=30,
+                                help="Gradient descent steps per run. The first "
+                                     "one is excluded from timing (JVM warmup).")
+    with c3:
+        mode_name = st.selectbox(
+            "Spark gradient code", list(MODES),
+            help="Vectorized packs each partition into NumPy matrices, so the "
+                 "gradient is one matrix product per block. Row by row loops "
+                 "over rows in Python; it is slower but scales more evenly, "
+                 "because there is more work to split up.")
+        mode = MODES[mode_name]
 
-res = st.session_state.get("results")
-if res and res["label"] == label:
-    show_results(res)
+    counts = core_counts(max_cores)
+    st.caption(f"Will run Spark with {', '.join(map(str, counts))} core(s), one "
+               "Spark process each, then the same training in plain NumPy.")
+
+    run_key = data_key + (mode,)
+    if st.button("Run benchmark", type="primary"):
+        lock = run_lock()
+        if not lock.acquire(blocking=False):
+            st.warning("Another benchmark is running. Wait for it to finish, "
+                       "since overlapping runs would distort both timings.")
+            st.stop()
+        try:
+            st.session_state.pop("results", None)
+            runs, check = [], None
+            steps = len(counts) + 1
+            progress = st.progress(0.0)
+            for i, cores in enumerate(counts):
+                progress.progress(i / steps,
+                                  text=f"Spark with {cores} core(s) "
+                                       f"({i + 1} of {steps})...")
+                # Correctness checks run once, on the last run, after its timed loop.
+                last = i == len(counts) - 1
+                result = run_bench(cores, data_path, label, iters, check=last, mode=mode)
+                if "error" in result:
+                    progress.empty()
+                    show_error(result)
+                    st.stop()
+                runs.append(result)
+                if last:
+                    check = result
+            progress.progress(len(counts) / steps,
+                              text=f"Plain NumPy, no Spark ({steps} of {steps})...")
+            numpy = run_numpy(data_path, label, iters)
+            progress.empty()
+            st.session_state.results = {"runs": runs, "check": check, "numpy": numpy,
+                                        "rows": n_rows, "key": run_key}
+        finally:
+            lock.release()
+
+    res = st.session_state.get("results")
+    if res and res.get("key") == run_key:
+        show_results(res)

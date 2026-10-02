@@ -1,11 +1,12 @@
 # numpy_baseline.py: the same batch gradient descent on one machine, no Spark.
 #
 # Usage:
-#   python numpy_baseline.py [--data FILE] [--iters N] [--threads T]
+#   python numpy_baseline.py [--data FILE] [--label COL] [--iters N] [--threads T]
 #   python numpy_baseline.py --npy PREFIX [--stream] [--chunk-mb MB] [--iters N]
 #
-# --data loads a HIGGS-layout CSV (no header, label in column 0) into memory
-# and standardizes it like train.standardize. --npy reads the output of
+# --data loads a CSV into memory and standardizes it like train.standardize:
+# without --label it is the HIGGS layout (no header, label in column 0), with
+# --label COL the first line is a header and COL is the label (as in bench.py). --npy reads the output of
 # make_big_data.py (PREFIX.X.npy, PREFIX.y.npy) instead: loaded whole into RAM by default, or with
 # --stream read from disk in chunks on every iteration, which is what one
 # machine has to do when the data is larger than its memory.
@@ -24,6 +25,7 @@ import time
 
 p = argparse.ArgumentParser(description="Single-machine NumPy baseline.")
 p.add_argument("--data", default="higgs_1m.csv")
+p.add_argument("--label", help="label column name; the CSV then needs a header row")
 p.add_argument("--npy", help="output prefix of make_big_data.py (used instead of --data)")
 p.add_argument("--stream", action="store_true",
                help="with --npy: re-read the file from disk in chunks every iteration")
@@ -49,11 +51,16 @@ def sigmoid(z):
     return 1 / (1 + np.exp(-z))
 
 
-def load_csv(path):
+def load_csv(path, label=None):
     import pandas as pd
-    raw = pd.read_csv(path, header=None, dtype=np.float64).to_numpy()
-    y = raw[:, 0]
-    feats = raw[:, 1:]
+    if label is None:
+        raw = pd.read_csv(path, header=None, dtype=np.float64).to_numpy()
+        y = raw[:, 0]
+        feats = raw[:, 1:]
+    else:
+        df = pd.read_csv(path, dtype=np.float64)
+        y = df[label].to_numpy()
+        feats = df.drop(columns=label).to_numpy()
     mean = feats.mean(axis=0)
     std = feats.std(axis=0)
     std = np.where(std < 1e-12, 1.0, std)
@@ -79,7 +86,7 @@ if args.npy:
               else (lambda: blocks))
 else:
     source = "csv-memory"
-    blocks = load_csv(args.data)
+    blocks = load_csv(args.data, args.label)
     chunks = lambda: blocks
 load_s = time.perf_counter() - t0
 
