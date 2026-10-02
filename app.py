@@ -165,7 +165,8 @@ def comparison_chart(rows):
     df["Label"] = df["Seconds per iteration"].map(
         lambda v: f"{v:.2f} s" if v >= 0.1 else f"{v:.3f} s")
     base = alt.Chart(df).encode(
-        y=alt.Y("Setup:N", sort=None, title=None, axis=alt.Axis(labelLimit=400)),
+        y=alt.Y("Setup:N", sort=None, title=None,
+                axis=alt.Axis(labelLimit=400, labelOverlap=False)),
         x=alt.X("Seconds per iteration:Q", title="Seconds per iteration (lower is faster)"),
     )
     bars = base.mark_bar().encode(
@@ -173,7 +174,7 @@ def comparison_chart(rows):
                                                   range=["#e25a1c", "#4c78a8"]),
                         legend=alt.Legend(title=None, orient="top")))
     text = base.mark_text(align="left", dx=4).encode(text="Label:N")
-    st.altair_chart((bars + text).properties(height=48 * len(df) + 40),
+    st.altair_chart((bars + text).properties(height=alt.Step(40)),
                     use_container_width=True)
 
 
@@ -207,7 +208,7 @@ def spark_recommendation(spark_s, np_s, data_gb, ram_gb):
             "Spark costs a fixed amount every iteration (scheduling tasks, moving "
             "data between the JVM and Python), and here that cost is larger than "
             "the math. Switch to Spark when the data outgrows one machine's "
-            "memory, as in the **Recorded cluster run** tab, where Spark on 4 "
+            "memory, as in the **Recorded cluster runs** tab, where Spark on 4 "
             "machines was 30x faster.")
         if ram_gb and data_gb > 0.5 * ram_gb:
             reasons.append("The data already uses over half of this machine's "
@@ -243,73 +244,167 @@ def show_numpy_comparison(runs, numpy, data_gb):
                f"NumPy {numpy['final_loss']:.6f}.")
 
 
-def load_recorded():
-    """Results of deploy/bigdata/run.sh, grouped by setup name."""
-    runs = {}
-    for f in sorted(glob.glob(os.path.join(RECORDED, "*.json"))):
-        with open(f) as fh:
-            r = json.load(fh)
-        if "error" not in r:
-            runs.setdefault(os.path.basename(f).split("-r")[0].removesuffix(".json"),
-                            []).append(r)
-    return runs
+# The two single-machine NumPy setups run.sh launches:
+# name -> (chart label, table label, short label).
+NUMPY_SETUPS = {
+    "numpy-64gb": ("NumPy, one 64 GB machine (data in RAM)",
+                   "NumPy, r6id.2xlarge (64 GB, in RAM)", "NumPy on 64 GB"),
+    "numpy-16gb": ("NumPy, one 16 GB machine (re-reads from disk)",
+                   "NumPy, m6id.xlarge (16 GB, from NVMe)", "NumPy on 16 GB"),
+}
+
+
+def load_recorded_runs():
+    """{run name: (meta, {setup: [result, ...]})} for each deploy/bigdata/results/<run>/."""
+    out = {}
+    for meta_path in sorted(glob.glob(os.path.join(RECORDED, "*", "meta.json"))):
+        folder = os.path.dirname(meta_path)
+        with open(meta_path) as fh:
+            meta = json.load(fh)
+        setups = {}
+        for f in sorted(glob.glob(os.path.join(folder, "*.json"))):
+            name = os.path.basename(f)
+            if name == "meta.json":
+                continue
+            try:
+                with open(f) as fh:
+                    r = json.load(fh)
+            except ValueError:
+                continue
+            # spark-e4-r0.json -> spark-e4; numpy-16gb.json -> numpy-16gb
+            setups.setdefault(name.split("-r")[0].removesuffix(".json"), []).append(r)
+        out[os.path.basename(folder)] = (meta, setups)
+    return out
+
+
+def recorded_recommendation(spark_s, nodes, np16_s, np64_s, data_gb, cached):
+    """
+    Spark-or-not verdict for a recorded cluster run. np16_s / np64_s are
+    seconds per iteration, or None if that machine could not run it.
+    Returns (use_spark, headline, reasons).
+    """
+    spark = f"Spark on {nodes} machines"
+    reasons = []
+    if np16_s is not None and np16_s <= spark_s:
+        return False, "Don't use Spark RDD for this data. Use plain NumPy.", [
+            f"Even the 16 GB machine was {spark_s / np16_s:.1f}x faster than {spark}.",
+            f"The data ({data_gb:.1f} GB in memory) is small enough for one ordinary machine."]
+    if np64_s is not None and np64_s <= 1.1 * spark_s:
+        reasons.append(f"The data ({data_gb:.1f} GB in memory) fits in one 64 GB machine, "
+                       f"and NumPy there ({np64_s:.2f} s per iteration) was as fast as "
+                       f"{spark} ({spark_s:.2f} s) or faster.")
+        if np16_s is not None:
+            reasons.append(f"On a 16 GB machine NumPy re-reads it from disk and was "
+                           f"{np16_s / spark_s:.0f}x slower than Spark, so the machine "
+                           "needs enough RAM.")
+        return False, "One big machine is enough. Use plain NumPy on a machine with enough RAM.", reasons
+    if np64_s is not None:
+        if np16_s is not None:
+            reasons.append(f"The data ({data_gb:.1f} GB in memory) is bigger than the 16 GB "
+                           f"machine's RAM, so plain NumPy re-reads it from disk every "
+                           f"iteration; {spark} keeps it in memory and is "
+                           f"{np16_s / spark_s:.0f}x faster.")
+        reasons.append(f"{spark} was also {np64_s / spark_s:.1f}x faster than NumPy on one "
+                       "64 GB machine. That machine is the simpler option if its speed is "
+                       "enough; Spark keeps scaling as machines are added.")
+        headline = "Use Spark RDD if you can run a cluster"
+    else:
+        reasons.append(f"The data ({data_gb:.1f} GB in memory) does not fit even in a 64 GB "
+                       f"machine; {spark} holds it in memory across machines.")
+        if np16_s is not None:
+            reasons.append(f"NumPy streaming it from disk on one machine was "
+                           f"{np16_s / spark_s:.0f}x slower.")
+        headline = "Use Spark RDD for this data"
+    if cached < 1.0:
+        reasons.append(f"Only {cached:.0%} of the data fit in the cluster's memory, so some "
+                       "of it was re-read every iteration. More nodes would be faster.")
+    return True, headline, reasons
 
 
 def show_recorded():
-    runs = load_recorded()
-    needed = ["spark-e4", "spark-e2", "numpy-64gb", "numpy-16gb"]
-    if not all(k in runs for k in needed):
+    runs = load_recorded_runs()
+    if not runs:
         st.info("No recorded cluster results found in deploy/bigdata/results/. "
                 "Run deploy/bigdata/run.sh to produce them.")
         return
-    med = {k: statistics.median(r["sec_per_iter_warm"] for r in runs[k]) for k in needed}
-    rows_n = runs["spark-e4"][0]["records"]
-    gb = runs["numpy-64gb"][0]["gb"]
+    names = list(runs)
+    if len(names) > 1:
+        default = names.index("higgs10x") if "higgs10x" in names else 0
+        run = st.selectbox("Run", names, index=default, format_func=lambda n: (
+            f"{runs[n][0].get('description', n)} ({runs[n][0].get('date', '')})"))
+    else:
+        run = names[0]
+    meta, setups = runs[run]
 
-    st.info(f"**Recorded, not live.** Measured on AWS on October 2, 2026; the "
-            f"full run takes about an hour. {rows_n / 1e6:.0f}M rows "
-            f"(10 copies of HIGGS), {gb:.1f} GB as float64: more than the 16 GB "
-            "machine's memory.")
-    comparison_chart([
-        ("Spark, 4 machines (32 cores)", med["spark-e4"], "Spark"),
-        ("Spark, 2 machines (16 cores)", med["spark-e2"], "Spark"),
-        ("NumPy, one 64 GB machine (data in RAM)", med["numpy-64gb"], "NumPy"),
-        ("NumPy, one 16 GB machine (re-reads from disk)", med["numpy-16gb"], "NumPy"),
-    ])
-    a, b, c = st.columns(3)
-    a.metric("Spark (4 machines) vs. NumPy on 16 GB",
-             f"{med['numpy-16gb'] / med['spark-e4']:.0f}x faster")
-    b.metric("Spark (4 machines) vs. NumPy on 64 GB",
-             f"{med['numpy-64gb'] / med['spark-e4']:.1f}x faster")
-    c.metric("Spark: 2 → 4 machines", f"{med['spark-e2'] / med['spark-e4']:.2f}x faster",
-             help="Perfect scaling would be 2.00x.")
-    show_recommendation(True, "Use Spark RDD for this data", [
-        f"The data ({gb:.1f} GB in memory) is bigger than the 16 GB machine's "
-        f"RAM, so plain NumPy re-reads it from disk every iteration; Spark on 4 "
-        f"machines keeps it in memory and is {med['numpy-16gb'] / med['spark-e4']:.0f}x faster.",
-        "If one machine with enough RAM is available, it is a simpler option: a "
-        "64 GB machine running NumPy matched 2 Spark machines. Spark pulls ahead "
-        f"from 4 machines ({med['numpy-64gb'] / med['spark-e4']:.1f}x faster) and keeps "
-        "scaling as machines are added.",
-    ])
-    st.write("**Same answer everywhere:** every 20-iteration run ends at loss "
-             f"{runs['spark-e4'][0]['final_loss']:.6f}.")
-    st.dataframe(pd.DataFrame([
-        {"Setup": "Spark, 4 × r5.2xlarge", "Seconds per iteration": med["spark-e4"],
-         "Runs": len(runs["spark-e4"]), "Final loss": runs["spark-e4"][0]["final_loss"]},
-        {"Setup": "Spark, 2 × r5.2xlarge", "Seconds per iteration": med["spark-e2"],
-         "Runs": len(runs["spark-e2"]), "Final loss": runs["spark-e2"][0]["final_loss"]},
-        {"Setup": "NumPy, r6id.2xlarge (64 GB, in RAM)", "Seconds per iteration": med["numpy-64gb"],
-         "Runs": 1, "Final loss": runs["numpy-64gb"][0]["final_loss"]},
-        {"Setup": "NumPy, m6id.xlarge (16 GB, from NVMe)", "Seconds per iteration": med["numpy-16gb"],
-         "Runs": 1, "Final loss": runs["numpy-16gb"][0]["final_loss"]},
-    ]), hide_index=True, column_config={
+    def ok(results):
+        return [r for r in results if "error" not in r]
+
+    spark = {int(k.split("-e")[1]): ok(v) for k, v in setups.items()
+             if k.startswith("spark-e") and ok(v)}
+    if not spark:
+        st.warning("This run has no successful Spark results yet.")
+        return
+    med = {n: statistics.median(r["sec_per_iter_warm"] for r in rs) for n, rs in spark.items()}
+    nodes = max(spark)
+    first = spark[nodes][0]
+    numpy = {k: setups.get(k, [{"error": "no result"}])[0] for k in NUMPY_SETUPS}
+    np_s = {k: (None if "error" in r else r["sec_per_iter_warm"]) for k, r in numpy.items()}
+    features = first.get("features") or next(
+        (r["features"] for r in numpy.values() if "features" in r), 0)
+    data_gb = first["records"] * (features + 2) * 8 / 1e9
+
+    st.info(f"**Recorded, not live.** Measured on AWS on {meta.get('date', '?')}; a "
+            f"full run takes about an hour. {first['records']:,} rows "
+            f"({meta.get('description', run)}), {data_gb:.1f} GB as float64.")
+
+    chart = [(f"Spark, {n} machine{'s' if n > 1 else ''} ({spark[n][0]['cores']} cores)",
+              med[n], "Spark") for n in sorted(spark, reverse=True)]
+    chart += [(NUMPY_SETUPS[k][0], v, "NumPy") for k, v in np_s.items() if v is not None]
+    comparison_chart(chart)
+    for k, r in numpy.items():
+        if "error" in r:
+            st.caption(f"{NUMPY_SETUPS[k][0]}: {r['error']}")
+
+    metrics = []
+    for k, v in np_s.items():
+        if v is None:
+            continue
+        ratio = max(v, med[nodes]) / min(v, med[nodes])
+        metrics.append((f"Spark ({nodes} machines) vs. {NUMPY_SETUPS[k][2]}",
+                        f"{ratio:.1f}x " + ("faster" if v > med[nodes] else "slower")))
+    half = min(spark)
+    if half < nodes:
+        metrics.append((f"Spark: {half} → {nodes} machines",
+                        f"{med[half] / med[nodes]:.2f}x faster"))
+    for col, (label, value) in zip(st.columns(len(metrics)), metrics):
+        col.metric(label, value)
+
+    show_recommendation(*recorded_recommendation(
+        med[nodes], nodes, np_s["numpy-16gb"], np_s["numpy-64gb"], data_gb,
+        first.get("cached_fraction", 1.0)))
+
+    if np_s["numpy-64gb"] is not None:
+        a, b = first["final_loss"], numpy["numpy-64gb"]["final_loss"]
+        same = (first["iters"] == numpy["numpy-64gb"]["iters"]
+                and abs(a - b) <= 1e-9 * max(1.0, abs(b)))
+        st.write(f"**Same answer:** Spark and NumPy both end at loss {a:.6f} after "
+                 f"{first['iters']} iterations." if same else
+                 f"Final loss: Spark {a:.6f}, NumPy (64 GB) {b:.6f}.")
+
+    table = [{"Setup": f"Spark, {n} machine{'s' if n > 1 else ''}",
+              "Seconds per iteration": med[n], "Runs": len(spark[n]),
+              "Iterations": spark[n][0]["iters"],
+              "Final loss": spark[n][0]["final_loss"]} for n in sorted(spark, reverse=True)]
+    table += [{"Setup": NUMPY_SETUPS[k][1], "Seconds per iteration": np_s[k], "Runs": 1,
+               "Iterations": r["iters"], "Final loss": r["final_loss"]}
+              for k, r in numpy.items() if np_s[k] is not None]
+    st.dataframe(pd.DataFrame(table), hide_index=True, column_config={
         "Seconds per iteration": st.column_config.NumberColumn(format="%.2f"),
         "Final loss": st.column_config.NumberColumn(format="%.6f")})
-    st.caption("Spark runs on EMR with data cached in memory (100% of partitions). "
-               "The 16 GB NumPy run did 6 iterations instead of 20 (81 s each); "
-               "its loss after 6 matches the 64 GB run's 6th iteration (0.668668). "
-               "Raw results: deploy/bigdata/results/.")
+    st.caption(f"Spark runs on EMR with {first.get('cached_fraction', 1.0):.0%} of the data "
+               "cached in memory. The 16 GB NumPy machine runs fewer iterations to save "
+               "time, so its final loss is from an earlier iteration. Raw results: "
+               f"deploy/bigdata/results/{run}/.")
 
 
 def show_results(res):
@@ -440,7 +535,7 @@ st.write(
     "(batch gradient descent, no MLlib). See how it speeds up as Spark gets "
     "more cores, and how it compares with plain NumPy on one machine.")
 
-live, recorded = st.tabs(["Run on this machine", "Recorded cluster run (AWS, 110M rows)"])
+live, recorded = st.tabs(["Run on this machine", "Recorded cluster runs (AWS)"])
 
 # The recorded tab is filled first: the live tab below calls st.stop() while
 # it waits for input, which would otherwise end the script before this runs.
