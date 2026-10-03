@@ -7,16 +7,20 @@
 import glob
 import hmac
 import json
-import statistics
 import os
+import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 import altair as alt
 import pandas as pd
 import streamlit as st
+from streamlit.runtime import Runtime
+from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 from preprocess import DataError, clean_csv, read_header
 
@@ -62,9 +66,52 @@ def core_counts(max_cores):
     return counts + [max_cores]
 
 
+UPLOAD_PREFIX = "spark-gd-"
+STALE_SECONDS = 3600     # leftover folders from earlier runs of the app
+
+
+@st.cache_resource
+def upload_dirs():
+    """Upload folders this server created: {session id: folder}."""
+    return {}
+
+
+def newest_mtime(folder):
+    paths = [folder] + [os.path.join(folder, f) for f in os.listdir(folder)]
+    return max(os.path.getmtime(p) for p in paths)
+
+
+def remove_old_upload_dirs():
+    """
+    Delete the upload folders of sessions that have ended. Every page refresh
+    starts a new session with its own copy of the upload (up to 1 GB plus the
+    cleaned copy), so without this they pile up and can fill the disk.
+    """
+    owned = upload_dirs()
+    runtime = Runtime.instance() if Runtime.exists() else None
+    for sid, folder in list(owned.items()):
+        if runtime is None or not runtime.is_active_session(sid):
+            shutil.rmtree(folder, ignore_errors=True)
+            owned.pop(sid, None)
+    # Folders left by an earlier run of the app are not in the registry;
+    # remove them once nothing has touched them for an hour.
+    known = set(owned.values())
+    for folder in glob.glob(os.path.join(tempfile.gettempdir(), UPLOAD_PREFIX + "*")):
+        try:
+            stale = time.time() - newest_mtime(folder) > STALE_SECONDS
+        except OSError:
+            continue
+        if folder not in known and stale:
+            shutil.rmtree(folder, ignore_errors=True)
+
+
 def session_dir():
     if "tmpdir" not in st.session_state:
-        st.session_state.tmpdir = tempfile.mkdtemp(prefix="spark-gd-")
+        remove_old_upload_dirs()
+        st.session_state.tmpdir = tempfile.mkdtemp(prefix=UPLOAD_PREFIX)
+        ctx = get_script_run_ctx()
+        if ctx is not None:
+            upload_dirs()[ctx.session_id] = st.session_state.tmpdir
     return st.session_state.tmpdir
 
 
