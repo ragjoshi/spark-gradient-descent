@@ -1,0 +1,1 @@
+{"name": "higgs10x", "description": "10 copies of HIGGS", "source": "s3://spark-gd-bench-236501162578-us-east-1/higgs/HIGGS.csv", "label": null, "copies": 10, "nodes": 4, "region": "us-east-1", "date": "2026-10-02"}
