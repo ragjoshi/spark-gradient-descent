@@ -99,6 +99,45 @@ compute-bound Amdahl system, but one where fixed overhead is a larger relative s
 low core counts. The honest headline is therefore **~90% parallel efficiency**, with
 the serial fraction cited as an estimated single-digit-percent range.
 
+## Spark vs. plain NumPy
+
+The scaling numbers above say how Spark compares with *itself* on fewer cores. The
+more important question is how it compares with no Spark at all. `numpy_baseline.py`
+runs the same gradient descent on one machine in plain NumPy:
+
+| Version (1M HIGGS rows, M2 MacBook Pro) | Best s/iter | vs. NumPy |
+|---|--:|--:|
+| Plain NumPy, one process (`numpy_baseline.py`) | 0.030 | 1× |
+| Spark, `--mode blocks`, 4 cores | 0.326 | ~11× slower |
+| Spark, `--mode rows` (original), 4 cores | 0.889 | ~30× slower |
+
+`--mode rows` runs the gradient one row at a time in Python, so each task pickles and
+loops over 125,000 tuples. `--mode blocks` (`train.to_blocks`) packs each partition into
+NumPy matrices once, so the gradient is one `X @ w` per block. That is 3.8× faster on
+1 core (0.825 vs. 3.10 s/iter) and gives the same weights to ~1e-16.
+
+Blocks mode, median of 3 interleaved reps:
+
+| Cores | Median s/iter | Speedup |
+|------:|--------------:|--------:|
+| 1     | 0.825         | 1.00×   |
+| 2     | 0.486         | 1.70×   |
+| 4     | 0.326         | 2.53×   |
+| 8     | 0.454         | noisy (0.30–0.63); the M2 has 4 performance + 4 efficiency cores |
+
+Blocks mode scales worse than rows mode because there is less work left to
+parallelize. What remains is mostly **fixed per-iteration overhead**. The same job on
+a 20,000-row file still takes 0.26 s/iter on 4 cores, so roughly 80% of the 0.326 s is
+coordination, not math. Most of it is a ~50 ms stall per Python task in PySpark 4.1:
+the JVM-side Python runner and the worker each wait on the other before a task starts.
+A job that runs entirely in the JVM costs ~5 ms per task; a Python task costs ~50 ms,
+even with a Unix domain socket instead of TCP.
+
+So on data that fits in one machine's RAM, NumPy wins: it reads 230 MB from memory in
+30 ms, which is less than Spark's fixed cost for a single iteration. Spark's overhead
+only becomes negligible when each iteration has much more data to process than one
+machine can hold in memory.
+
 ## Repository structure
 
 ```
@@ -107,9 +146,13 @@ spark-project/
 ├── train.py         # Training driver: CSV loader, distributed GD loop, correctness checks
 ├── preprocess.py    # Validates and cleans uploaded CSVs with readable errors
 ├── bench.py         # Strong-scaling benchmark harness (one run per process, JSON output)
+├── numpy_baseline.py # The same gradient descent in plain NumPy on one machine
 ├── app.py           # Streamlit front end: upload a CSV, run the scaling benchmark
 ├── analyze.py       # Computes speedup / efficiency / serial fraction from results.csv
 ├── requirements.txt # Pinned Python dependencies
+├── Dockerfile       # Container image for the app (Python 3.12 + Java 21)
+├── deploy/          # EC2 app deploy; bigdata/ = cluster benchmark (see Big-data benchmark)
+├── make_big_data.py # Builds K standardized copies of a CSV as .npy for numpy_baseline.py
 ├── results.csv      # Clean benchmark results (9 runs: 1/2/4 cores × 3 reps)
 ├── results_raw.csv  # Unfiltered measurement log (includes caught contamination)
 └── higgs_1m.csv     # 1M-row HIGGS subset (28 features + label) — not committed
@@ -141,14 +184,17 @@ label column instead:
 python bench.py 4 0 --data mydata.csv --label target --iters 30 --check
 ```
 
-Custom-data runs never write to `results.csv`. `--check` adds the correctness checks
+Add `--mode blocks` to any run to use the vectorized gradient (one NumPy matrix per
+block instead of one Python row at a time); HIGGS runs in that mode append to
+`results_blocks.csv`. Custom-data runs never write to `results.csv`. `--check` adds the correctness checks
 (scikit-learn cosine similarity, and an exact comparison against the same gradient
 descent run in plain NumPy). The last line of output is always a JSON object.
 
 `train.py` is imported by `bench.py` (it exposes the loader, standardizer, and training
 loop). It can also be run directly for a single 200-iteration training run with full
 diagnostics: `python train.py` for HIGGS, or `python train.py mydata.csv target`.
-Once results are collected, compute the speedup / efficiency / serial-fraction table
+For the single-machine baseline, run `python numpy_baseline.py` (`--threads 1` to
+cap NumPy at one core). Once results are collected, compute the speedup / efficiency / serial-fraction table
 with:
 
 ```bash
@@ -208,6 +254,114 @@ Things to know:
   with a header row is about 700 MB.
 - Restart the app after editing `train.py` or `preprocess.py`; Streamlit does not
   reload imported modules.
+
+## Deploying to AWS
+
+To use the app from other machines, run it on an EC2 instance. The app runs in
+Docker (`Dockerfile`: Python 3.12 + Java 21), and Spark still uses `local[N]` on
+that one instance.
+
+1. **Launch an instance** in the EC2 console:
+   - AMI: Amazon Linux 2023 (x86_64).
+   - Type: `c7a.2xlarge` (8 vCPUs, 16 GB, about $0.41/hour). On AMD `c7a`, each
+     vCPU is a full physical core, so 1→8 cores is a fair scaling test. On Intel
+     types like `c7i`, 8 vCPUs are only 4 physical cores with hyperthreading.
+   - Storage: 30 GB (Docker image plus uploads of up to 1 GB each).
+   - Key pair: create or choose one and keep the `.pem` file.
+   - Security group: SSH (22) from **My IP**, and HTTP (80) from the IPs of the
+     machines you will test from. Use "Anywhere" only together with `APP_PASSWORD`.
+   - Advanced details → User data: paste the contents of `deploy/user-data.sh`
+     (it installs Docker).
+2. **Deploy** from this folder, about a minute after the instance starts:
+   ```bash
+   APP_PASSWORD=choose-a-password deploy/deploy.sh <instance-public-ip> ~/path/to/key.pem
+   ```
+   This copies the project with rsync, builds the image on the instance, and starts
+   the container on port 80, set to restart if it stops. Run the same command again
+   to redeploy after code changes. Leave out `APP_PASSWORD` to skip the password page.
+3. Open `http://<instance-public-ip>` on any machine.
+
+Notes:
+
+- Only one benchmark runs at a time across all users, so concurrent runs can't
+  distort each other's timings. Others see a "wait" message.
+- The site is plain HTTP, so the password and uploads are not encrypted. Keep the
+  security group restricted to your IPs.
+- Uploads stay in the container's `/tmp` until the next redeploy.
+- **Stop the instance** when you're done. It is billed by the hour while running.
+
+## Big-data benchmark on AWS
+
+`deploy/bigdata/` tests the case Spark is built for: data larger than one
+machine's memory. By default it uses 10 copies of the full HIGGS dataset
+(110M rows, 75 GB as CSV, 26 GB as float64); `--data` runs it on any CSV
+instead. It compares:
+
+- **Spark** on an EMR cluster (4 spot nodes by default, 8 vCPUs and 64 GB
+  each), data cached in memory across the nodes, run on all nodes and on half.
+- **NumPy on a 16 GB machine** (`m6id.xlarge`), which must re-read the data
+  from its NVMe disk on every iteration (`numpy_baseline.py --stream`).
+- **NumPy on a 64 GB machine** (`r6id.2xlarge`), which holds it all in RAM,
+  or reports that it does not fit.
+
+All three report the loss after the same number of iterations, which must
+match. Requirements: the AWS CLI, configured with credentials and a region.
+
+```bash
+deploy/bigdata/run.sh check     # credentials and vCPU quotas; launches nothing
+deploy/bigdata/run.sh up        # launch (about $3-8 in total)
+deploy/bigdata/run.sh status
+deploy/bigdata/run.sh results   # download and compare
+deploy/bigdata/run.sh down      # stop anything still running
+```
+
+To benchmark your own data, pass it to `check` and `up`:
+
+```bash
+deploy/bigdata/run.sh up --data s3://my-bucket/sales/ --label churned
+deploy/bigdata/run.sh up --data ~/data/big.csv --label target --copies 3 --nodes 2
+```
+
+`--data` takes a local file or folder (uploaded to S3 first), an `s3://` file,
+or an `s3://` folder ending in `/`. Without `--label` the files are in the
+HIGGS layout (no header, label in column 0); with it, each file has a header
+row. The data must already be clean: all values numeric, no missing values,
+and a 0/1 label (the cluster does not run the app's file checker, which loads
+everything on one machine). `--copies K` repeats the data K times, `--nodes N`
+sets the cluster size, and `--name` sets the results folder. Each run's
+results go to `deploy/bigdata/results/<name>/`, and the app's
+**Recorded cluster runs** tab shows every run there, with a recommendation:
+plain NumPy, one big machine, or Spark.
+
+### Results (October 2026, us-east-1)
+
+Same data in every row: 110M rows, 26.4 GB as float64. Raw JSON is in
+`deploy/bigdata/results/higgs10x/`.
+
+| Setup | s/iter | vs. Spark on 4 nodes | Final loss |
+|---|--:|--:|--:|
+| Spark, 4 × r5.2xlarge (32 cores, data cached) | **2.73** | 1× | 0.650322 |
+| Spark, 2 × r5.2xlarge (16 cores, data cached) | 5.31 | 1.9× slower | 0.650322 |
+| NumPy, 1 × r6id.2xlarge (64 GB, data in RAM) | 5.53 | 2.0× slower | 0.650322 |
+| NumPy, 1 × m6id.xlarge (16 GB, re-reads from NVMe) | 80.93 | 30× slower | 0.668668 (6 iters) |
+
+- **Spark wins once the data no longer fits on one machine.** The 16 GB machine
+  spends every iteration re-reading 26 GB from disk (~0.33 GB/s); the cluster
+  keeps it all in memory and is 30× faster.
+- **Scaling across machines is nearly linear:** 2 → 4 nodes is 1.95× faster, and
+  both repetitions agreed to within 1%.
+- **One big machine is the real competitor.** A single 64 GB machine running NumPy
+  matches 2 Spark nodes. Spark only pulls ahead with more nodes, and that machine
+  had a newer CPU than the r5 cluster nodes.
+- **Same answer everywhere:** after 20 iterations the loss agrees to 13 decimal
+  places (the 16 GB run did 6 iterations; it matches the 64 GB run's 6th, 0.668668).
+
+Combined with the laptop numbers above: on 1M rows NumPy is 11× faster than
+Spark; on 110M rows that don't fit in one machine's memory, Spark is 30× faster.
+
+Every machine terminates itself when its benchmark finishes (hard caps: 3 h
+for the cluster's step, 2.5 h for the NumPy instances). The data stays in S3
+until you delete the bucket; `down` prints the command.
 
 ## Notes
 

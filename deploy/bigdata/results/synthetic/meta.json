@@ -1,0 +1,1 @@
+{"name": "synthetic", "description": "20 copies of synthetic.csv", "source": "s3://spark-gd-bench-236501162578-us-east-1/input/synthetic/synthetic.csv", "label": "outcome", "copies": 20, "nodes": 2, "region": "us-east-1", "date": "2026-10-02"}

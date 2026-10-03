@@ -1,0 +1,9 @@
+.git
+.venv
+__pycache__
+*.pyc
+.DS_Store
+HIGGS.csv.gz
+higgs_1m.csv
+deploy
+!deploy/bigdata/results
