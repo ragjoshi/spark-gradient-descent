@@ -7,23 +7,26 @@
 import glob
 import hmac
 import json
-import statistics
 import os
+import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 import altair as alt
 import pandas as pd
 import streamlit as st
+from streamlit.runtime import Runtime
+from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 from preprocess import DataError, clean_csv, read_header
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BENCH = os.path.join(HERE, "bench.py")
 NUMPY = os.path.join(HERE, "numpy_baseline.py")
-HIGGS = os.path.join(HERE, "higgs_1m.csv")          # no header, label in column 0
 RECORDED = os.path.join(HERE, "deploy", "bigdata", "results")
 MODES = {"Vectorized (one NumPy matrix per block)": "blocks",
          "Row by row (original)": "rows"}
@@ -63,9 +66,52 @@ def core_counts(max_cores):
     return counts + [max_cores]
 
 
+UPLOAD_PREFIX = "spark-gd-"
+STALE_SECONDS = 3600     # leftover folders from earlier runs of the app
+
+
+@st.cache_resource
+def upload_dirs():
+    """Upload folders this server created: {session id: folder}."""
+    return {}
+
+
+def newest_mtime(folder):
+    paths = [folder] + [os.path.join(folder, f) for f in os.listdir(folder)]
+    return max(os.path.getmtime(p) for p in paths)
+
+
+def remove_old_upload_dirs():
+    """
+    Delete the upload folders of sessions that have ended. Every page refresh
+    starts a new session with its own copy of the upload (up to 1 GB plus the
+    cleaned copy), so without this they pile up and can fill the disk.
+    """
+    owned = upload_dirs()
+    runtime = Runtime.instance() if Runtime.exists() else None
+    for sid, folder in list(owned.items()):
+        if runtime is None or not runtime.is_active_session(sid):
+            shutil.rmtree(folder, ignore_errors=True)
+            owned.pop(sid, None)
+    # Folders left by an earlier run of the app are not in the registry;
+    # remove them once nothing has touched them for an hour.
+    known = set(owned.values())
+    for folder in glob.glob(os.path.join(tempfile.gettempdir(), UPLOAD_PREFIX + "*")):
+        try:
+            stale = time.time() - newest_mtime(folder) > STALE_SECONDS
+        except OSError:
+            continue
+        if folder not in known and stale:
+            shutil.rmtree(folder, ignore_errors=True)
+
+
 def session_dir():
     if "tmpdir" not in st.session_state:
-        st.session_state.tmpdir = tempfile.mkdtemp(prefix="spark-gd-")
+        remove_old_upload_dirs()
+        st.session_state.tmpdir = tempfile.mkdtemp(prefix=UPLOAD_PREFIX)
+        ctx = get_script_run_ctx()
+        if ctx is not None:
+            upload_dirs()[ctx.session_id] = st.session_state.tmpdir
     return st.session_state.tmpdir
 
 
@@ -543,65 +589,55 @@ with recorded:
     show_recorded()
 
 with live:
-    sources = (["HIGGS sample (1M rows, built in)"] if os.path.exists(HIGGS) else [])
-    sources.append("Upload a CSV")
-    source = st.radio("Data", sources, horizontal=True)
+    uploaded = st.file_uploader(
+        "CSV with a header row, numeric columns, and a 0/1 label column",
+        type=["csv", "tsv", "txt"])
+    if uploaded is None:
+        st.stop()
 
-    if source.startswith("HIGGS"):
-        # Already numeric and clean: no header, label in column 0.
-        data_path, label, n_rows, n_features = HIGGS, None, 1_000_000, 28
-        data_key = ("higgs",)
-        st.success("Ready: 1,000,000 rows of HIGGS; 28 features; label in column 0.")
-    else:
-        uploaded = st.file_uploader(
-            "CSV with a header row, numeric columns, and a 0/1 label column",
-            type=["csv", "tsv", "txt"])
-        if uploaded is None:
-            st.stop()
+    raw_path = save_upload(uploaded)
+    try:
+        columns = read_header(raw_path)
+    except DataError as e:
+        st.error(str(e))
+        st.stop()
 
-        raw_path = save_upload(uploaded)
-        try:
-            columns = read_header(raw_path)
-        except DataError as e:
-            st.error(str(e))
-            st.stop()
+    guess = next((c for c in columns if str(c).strip().lower() in LABEL_GUESSES),
+                 columns[-1])
+    label = st.selectbox("Label column (what to predict)", columns,
+                         index=columns.index(guess))
 
-        guess = next((c for c in columns if str(c).strip().lower() in LABEL_GUESSES),
-                     columns[-1])
-        label = st.selectbox("Label column (what to predict)", columns,
-                             index=columns.index(guess))
+    data_path = os.path.join(session_dir(), "clean.csv")
+    # Cleaning a large file takes seconds (about 20 s for 1M rows), and
+    # Streamlit reruns this script on every widget change, so clean once
+    # per (file, label).
+    clean_key = (st.session_state.upload_id, label)
+    if st.session_state.get("clean_key") != clean_key:
+        with st.spinner("Checking the file..."):
+            try:
+                st.session_state.clean_result = clean_csv(raw_path, label, data_path)
+            except DataError as e:
+                st.session_state.clean_result = DataError(str(e))
+        st.session_state.clean_key = clean_key
+    summary = st.session_state.clean_result
+    if isinstance(summary, DataError):
+        st.error(str(summary))
+        st.stop()
 
-        data_path = os.path.join(session_dir(), "clean.csv")
-        # Cleaning a large file takes seconds (about 20 s for 1M rows), and
-        # Streamlit reruns this script on every widget change, so clean once
-        # per (file, label).
-        clean_key = (st.session_state.upload_id, label)
-        if st.session_state.get("clean_key") != clean_key:
-            with st.spinner("Checking the file..."):
-                try:
-                    st.session_state.clean_result = clean_csv(raw_path, label, data_path)
-                except DataError as e:
-                    st.session_state.clean_result = DataError(str(e))
-            st.session_state.clean_key = clean_key
-        summary = st.session_state.clean_result
-        if isinstance(summary, DataError):
-            st.error(str(summary))
-            st.stop()
-
-        notes = [f"{summary['rows']:,} rows", f"{summary['n_features']} features"]
-        if summary["rows_dropped"]:
-            notes.append(f"{summary['rows_dropped']:,} rows with missing values dropped")
-        if summary["ignored_columns"]:
-            notes.append("ignored index column(s): " + ", ".join(summary["ignored_columns"]))
-        st.success("Ready: " + "; ".join(notes) + ".")
-        if summary["likely_id_columns"]:
-            st.warning(
-                "These columns look like row numbers (whole numbers counting up "
-                "with no gaps): " + ", ".join(summary["likely_id_columns"]) + ". "
-                "They are being used as features, which teaches the model nothing "
-                "real. Remove them from the file if they are IDs.")
-        n_rows, n_features = summary["rows"], summary["n_features"]
-        data_key = ("upload", st.session_state.upload_id, label)
+    notes = [f"{summary['rows']:,} rows", f"{summary['n_features']} features"]
+    if summary["rows_dropped"]:
+        notes.append(f"{summary['rows_dropped']:,} rows with missing values dropped")
+    if summary["ignored_columns"]:
+        notes.append("ignored index column(s): " + ", ".join(summary["ignored_columns"]))
+    st.success("Ready: " + "; ".join(notes) + ".")
+    if summary["likely_id_columns"]:
+        st.warning(
+            "These columns look like row numbers (whole numbers counting up "
+            "with no gaps): " + ", ".join(summary["likely_id_columns"]) + ". "
+            "They are being used as features, which teaches the model nothing "
+            "real. Remove them from the file if they are IDs.")
+    n_rows, n_features = summary["rows"], summary["n_features"]
+    data_key = ("upload", st.session_state.upload_id, label)
 
     c1, c2, c3 = st.columns(3)
     with c1:
