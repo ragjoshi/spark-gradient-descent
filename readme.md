@@ -259,35 +259,43 @@ Things to know:
 
 To use the app from other machines, run it on an EC2 instance. The app runs in
 Docker (`Dockerfile`: Python 3.12 + Java 21), and Spark still uses `local[N]` on
-that one instance.
+that one instance. `deploy/app.sh` does the whole setup with the AWS CLI (no
+console clicking):
 
-1. **Launch an instance** in the EC2 console:
-   - AMI: Amazon Linux 2023 (x86_64).
-   - Type: `c7a.2xlarge` (8 vCPUs, 16 GB, about $0.41/hour). On AMD `c7a`, each
-     vCPU is a full physical core, so 1→8 cores is a fair scaling test. On Intel
-     types like `c7i`, 8 vCPUs are only 4 physical cores with hyperthreading.
-   - Storage: 30 GB (Docker image plus uploads of up to 1 GB each).
-   - Key pair: create or choose one and keep the `.pem` file.
-   - Security group: SSH (22) from **My IP**, and HTTP (80) from the IPs of the
-     machines you will test from. Use "Anywhere" only together with `APP_PASSWORD`.
-   - Advanced details → User data: paste the contents of `deploy/user-data.sh`
-     (it installs Docker).
-2. **Deploy** from this folder, about a minute after the instance starts:
-   ```bash
-   APP_PASSWORD=choose-a-password deploy/deploy.sh <instance-public-ip> ~/path/to/key.pem
-   ```
-   This copies the project with rsync, builds the image on the instance, and starts
-   the container on port 80, set to restart if it stops. Run the same command again
-   to redeploy after code changes. Leave out `APP_PASSWORD` to skip the password page.
-3. Open `http://<instance-public-ip>` on any machine.
+```bash
+deploy/app.sh up        # first time: SSH key, firewall, instance, deploy (~8 min)
+deploy/app.sh stop      # pause it: no compute charge while stopped
+deploy/app.sh start     # resume; prints the new address (it changes on each start)
+deploy/app.sh deploy    # push code changes to the running instance
+deploy/app.sh allow-ip  # let in the network you are on now
+deploy/app.sh status
+deploy/app.sh down      # delete the instance and firewall
+```
+
+- **Instance:** `c7a.2xlarge` (8 vCPUs, 16 GB, about $0.41/hour while running,
+  about $2.40/month for the 30 GB disk while stopped). On AMD `c7a`, each vCPU is
+  a full physical core, so 1→8 cores is a fair scaling test. On Intel types like
+  `c7i`, 8 vCPUs are only 4 physical cores with hyperthreading.
+- **Access:** only the IP address you ran `up` from can open the page (and SSH
+  in). On a different network, run `allow-ip`. To share the page with anyone,
+  set a password and open it up:
+  ```bash
+  APP_PASSWORD=choose-a-password deploy/app.sh deploy
+  deploy/app.sh public
+  ```
+- **Under the hood:** `up` creates the key pair (`~/.ssh/spark-gd-app.pem`) and a
+  security group, launches the instance with `deploy/user-data.sh` (installs
+  Docker), then runs `deploy/deploy.sh`, which copies the project with rsync,
+  builds the image on the instance, and starts the container on port 80, set to
+  restart if it stops (including after `stop` / `start`).
 
 Notes:
 
 - Only one benchmark runs at a time across all users, so concurrent runs can't
   distort each other's timings. Others see a "wait" message.
-- The site is plain HTTP, so the password and uploads are not encrypted. Keep the
-  security group restricted to your IPs.
-- Uploads stay in the container's `/tmp` until the next redeploy.
+- The site is plain HTTP, so the password and uploads are not encrypted. Keep
+  access restricted to your IPs unless you need to share it.
+- Uploads stay in the container's `/tmp`; the app deletes those of ended sessions.
 - **Stop the instance** when you're done. It is billed by the hour while running.
 
 ## Big-data benchmark on AWS
