@@ -16,7 +16,8 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
 rsync -az --delete -e "ssh ${SSH_OPTS[*]}" \
   --exclude .git --exclude .venv --exclude __pycache__ \
-  --exclude higgs_1m.csv --exclude HIGGS.csv.gz \
+  --exclude higgs_1m.csv --exclude higgs_1m_upload.csv --exclude HIGGS.csv.gz \
+  --exclude .claude \
   "$ROOT/" "$REMOTE:spark-app/"
 
 # Pass the password through stdin, not the command line, so it does not
