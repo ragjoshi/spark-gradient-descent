@@ -23,7 +23,6 @@ from preprocess import DataError, clean_csv, read_header
 HERE = os.path.dirname(os.path.abspath(__file__))
 BENCH = os.path.join(HERE, "bench.py")
 NUMPY = os.path.join(HERE, "numpy_baseline.py")
-HIGGS = os.path.join(HERE, "higgs_1m.csv")          # no header, label in column 0
 RECORDED = os.path.join(HERE, "deploy", "bigdata", "results")
 MODES = {"Vectorized (one NumPy matrix per block)": "blocks",
          "Row by row (original)": "rows"}
@@ -543,65 +542,55 @@ with recorded:
     show_recorded()
 
 with live:
-    sources = (["HIGGS sample (1M rows, built in)"] if os.path.exists(HIGGS) else [])
-    sources.append("Upload a CSV")
-    source = st.radio("Data", sources, horizontal=True)
+    uploaded = st.file_uploader(
+        "CSV with a header row, numeric columns, and a 0/1 label column",
+        type=["csv", "tsv", "txt"])
+    if uploaded is None:
+        st.stop()
 
-    if source.startswith("HIGGS"):
-        # Already numeric and clean: no header, label in column 0.
-        data_path, label, n_rows, n_features = HIGGS, None, 1_000_000, 28
-        data_key = ("higgs",)
-        st.success("Ready: 1,000,000 rows of HIGGS; 28 features; label in column 0.")
-    else:
-        uploaded = st.file_uploader(
-            "CSV with a header row, numeric columns, and a 0/1 label column",
-            type=["csv", "tsv", "txt"])
-        if uploaded is None:
-            st.stop()
+    raw_path = save_upload(uploaded)
+    try:
+        columns = read_header(raw_path)
+    except DataError as e:
+        st.error(str(e))
+        st.stop()
 
-        raw_path = save_upload(uploaded)
-        try:
-            columns = read_header(raw_path)
-        except DataError as e:
-            st.error(str(e))
-            st.stop()
+    guess = next((c for c in columns if str(c).strip().lower() in LABEL_GUESSES),
+                 columns[-1])
+    label = st.selectbox("Label column (what to predict)", columns,
+                         index=columns.index(guess))
 
-        guess = next((c for c in columns if str(c).strip().lower() in LABEL_GUESSES),
-                     columns[-1])
-        label = st.selectbox("Label column (what to predict)", columns,
-                             index=columns.index(guess))
+    data_path = os.path.join(session_dir(), "clean.csv")
+    # Cleaning a large file takes seconds (about 20 s for 1M rows), and
+    # Streamlit reruns this script on every widget change, so clean once
+    # per (file, label).
+    clean_key = (st.session_state.upload_id, label)
+    if st.session_state.get("clean_key") != clean_key:
+        with st.spinner("Checking the file..."):
+            try:
+                st.session_state.clean_result = clean_csv(raw_path, label, data_path)
+            except DataError as e:
+                st.session_state.clean_result = DataError(str(e))
+        st.session_state.clean_key = clean_key
+    summary = st.session_state.clean_result
+    if isinstance(summary, DataError):
+        st.error(str(summary))
+        st.stop()
 
-        data_path = os.path.join(session_dir(), "clean.csv")
-        # Cleaning a large file takes seconds (about 20 s for 1M rows), and
-        # Streamlit reruns this script on every widget change, so clean once
-        # per (file, label).
-        clean_key = (st.session_state.upload_id, label)
-        if st.session_state.get("clean_key") != clean_key:
-            with st.spinner("Checking the file..."):
-                try:
-                    st.session_state.clean_result = clean_csv(raw_path, label, data_path)
-                except DataError as e:
-                    st.session_state.clean_result = DataError(str(e))
-            st.session_state.clean_key = clean_key
-        summary = st.session_state.clean_result
-        if isinstance(summary, DataError):
-            st.error(str(summary))
-            st.stop()
-
-        notes = [f"{summary['rows']:,} rows", f"{summary['n_features']} features"]
-        if summary["rows_dropped"]:
-            notes.append(f"{summary['rows_dropped']:,} rows with missing values dropped")
-        if summary["ignored_columns"]:
-            notes.append("ignored index column(s): " + ", ".join(summary["ignored_columns"]))
-        st.success("Ready: " + "; ".join(notes) + ".")
-        if summary["likely_id_columns"]:
-            st.warning(
-                "These columns look like row numbers (whole numbers counting up "
-                "with no gaps): " + ", ".join(summary["likely_id_columns"]) + ". "
-                "They are being used as features, which teaches the model nothing "
-                "real. Remove them from the file if they are IDs.")
-        n_rows, n_features = summary["rows"], summary["n_features"]
-        data_key = ("upload", st.session_state.upload_id, label)
+    notes = [f"{summary['rows']:,} rows", f"{summary['n_features']} features"]
+    if summary["rows_dropped"]:
+        notes.append(f"{summary['rows_dropped']:,} rows with missing values dropped")
+    if summary["ignored_columns"]:
+        notes.append("ignored index column(s): " + ", ".join(summary["ignored_columns"]))
+    st.success("Ready: " + "; ".join(notes) + ".")
+    if summary["likely_id_columns"]:
+        st.warning(
+            "These columns look like row numbers (whole numbers counting up "
+            "with no gaps): " + ", ".join(summary["likely_id_columns"]) + ". "
+            "They are being used as features, which teaches the model nothing "
+            "real. Remove them from the file if they are IDs.")
+    n_rows, n_features = summary["rows"], summary["n_features"]
+    data_key = ("upload", st.session_state.upload_id, label)
 
     c1, c2, c3 = st.columns(3)
     with c1:
