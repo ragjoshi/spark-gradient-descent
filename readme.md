@@ -6,13 +6,12 @@ dataset. No MLlib — the distributed gradient computation, aggregation, and tra
 loop are all hand-written to expose the actual mechanics of at-scale optimization.
 
 The project answers one practical question: **when is Spark worth it?** It runs the
-same training three ways, each one a step up in scale:
+same training two ways, each one a step up in scale:
 
 | | Where it runs | Spark setup | Data | What it shows |
 |---|---|---|---|---|
 | [1. Local](#walkthrough-1-the-app-on-your-laptop) | Your laptop | `local[N]`: 1 machine, N cores | Any CSV you upload (tested on 1M rows) | How Spark scales with cores, and that NumPy beats it on small data |
-| [2. App on AWS](#walkthrough-2-the-app-on-aws-one-ec2-machine) | One EC2 machine (8 cores) | `local[N]` inside Docker | Same as local | The same app, reachable from any browser |
-| [3. Cluster on AWS](#walkthrough-3-the-4-machine-spark-cluster-on-aws-emr) | EMR cluster (4 worker machines) vs. 2 single machines | YARN, 32 cores across 4 machines | 110M rows, 26 GB | Spark winning once the data outgrows one machine |
+| [2. Cluster on AWS](#walkthrough-2-the-4-machine-spark-cluster-on-aws-emr) | EMR cluster (4 worker machines) vs. 2 single machines | YARN, 32 cores across 4 machines | 110M rows, 26 GB | Spark winning once the data outgrows one machine |
 
 **The short answer:** on 1M rows, plain NumPy on one machine is 11× faster than
 Spark. On 110M rows that don't fit in one machine's memory, Spark on 4 machines is
@@ -22,13 +21,13 @@ big for one machine.
 ## Contents
 
 - [Tech stack](#tech-stack)
-- [How the training works](#how-the-training-works) (the same in all three setups)
+- [How the training works](#how-the-training-works) (the same in both setups)
 - [Walkthrough 1: the app on your laptop](#walkthrough-1-the-app-on-your-laptop)
-- [Walkthrough 2: the app on AWS (one EC2 machine)](#walkthrough-2-the-app-on-aws-one-ec2-machine)
-- [Walkthrough 3: the 4-machine Spark cluster on AWS (EMR)](#walkthrough-3-the-4-machine-spark-cluster-on-aws-emr)
+- [Walkthrough 2: the 4-machine Spark cluster on AWS (EMR)](#walkthrough-2-the-4-machine-spark-cluster-on-aws-emr)
 - [Deep dive: the laptop benchmark](#deep-dive-the-laptop-benchmark) (results,
   engineering decisions, methodology, scaling analysis, Spark vs. NumPy)
 - [Repository structure](#repository-structure)
+- [Appendix: hosting the app on AWS](#appendix-hosting-the-app-on-aws)
 
 ## Tech stack
 
@@ -39,8 +38,6 @@ big for one machine.
 | Correctness check | **scikit-learn** | Reference logistic regression the trained weights are compared with |
 | Data checks | **pandas** | Reads and validates uploaded CSVs (`preprocess.py`) |
 | Web app | **Streamlit** + Altair charts | Upload a CSV, run the benchmark, see charts and a recommendation |
-| Packaging | **Docker** (Python 3.12 + Java 21) | Same app environment on any machine |
-| App hosting | **AWS EC2** (`c7a.2xlarge`, Amazon Linux 2023) | One 8-core machine running the app container |
 | Cluster | **AWS EMR 7** (Spark on **YARN**), **Spot** instances | 1 master + 4 worker machines (8 cores, 64 GB each) |
 | Storage | **AWS S3** | Code, the 75 GB dataset, and results, shared by every machine |
 | Automation | **Bash + AWS CLI** | `deploy/app.sh` and `deploy/bigdata/run.sh`: everything launched with one command, no console clicking |
@@ -54,7 +51,7 @@ iteration looks at all the data once, computes the gradient (which direction to 
 the weights), and takes one step. That full pass over the data is the expensive part,
 and it is what Spark parallelizes.
 
-One iteration, in every setup:
+One iteration, in both setups:
 
 ```
                           ┌──────────────────────────────┐
@@ -96,13 +93,12 @@ What the code does (`train.py`, `gradient.py`):
   matrices once, so the gradient is one `X @ w` per block). Both give the same
   weights; blocks is 3.8× faster on 1 core.
 
-The only thing that changes between the three setups is **where the driver and
+The only thing that changes between the two setups is **where the driver and
 workers live**:
 
 | Setup | Driver | Workers | Data comes from |
 |---|---|---|---|
 | Local | A process on your laptop | N threads on your laptop (`local[N]`) | The uploaded CSV |
-| App on AWS | A process in the Docker container on EC2 | N threads on that EC2 machine | The uploaded CSV |
 | Cluster | The EMR master machine | 4 executors, one per worker machine, 8 cores each (YARN) | S3 |
 
 Every run checks itself: the same gradient descent is re-run in plain NumPy and the
@@ -130,7 +126,7 @@ streamlit run app.py
 
 Then open the URL it prints (usually http://localhost:8501). The page has two tabs:
 **Run on this machine** (a live benchmark on your data) and **Recorded cluster runs
-(AWS)** (the results of walkthrough 3, read from files in the repo, so it works
+(AWS)** (the results of walkthrough 2, read from files in the repo, so it works
 offline).
 
 ### Using it
@@ -259,83 +255,9 @@ is a 1,000,000-row subset. It is not committed to the repo due to size.
 
 ---
 
-## Walkthrough 2: the app on AWS (one EC2 machine)
+## Walkthrough 2: the 4-machine Spark cluster on AWS (EMR)
 
-The same app, hosted so anyone with the link can use it. Nothing about the Spark
-code changes: Spark still uses `local[N]`, now on the EC2 machine's 8 cores instead
-of the laptop's. The difference is a fair, quiet machine: 8 identical physical cores,
-no thermal throttling, no other apps.
-
-### Set up and start
-
-Requirements: the AWS CLI, configured with credentials and a region. The app runs in
-Docker (`Dockerfile`: Python 3.12 + Java 21). `deploy/app.sh` does the whole setup
-with the AWS CLI (no console clicking):
-
-```bash
-deploy/app.sh up        # first time: SSH key, firewall, instance, deploy (~8 min)
-deploy/app.sh stop      # pause it: no compute charge while stopped
-deploy/app.sh start     # resume; prints the new address (it changes on each start)
-deploy/app.sh deploy    # push code changes to the running instance
-deploy/app.sh allow-ip  # let in the network you are on now
-deploy/app.sh status
-deploy/app.sh down      # delete the instance and firewall
-```
-
-`up` prints the address (`http://<ip>`). Open it and use the app exactly as in
-walkthrough 1.
-
-### What `up` does, step by step
-
-```
- Your laptop                                   AWS (your default region)
- ───────────                                   ─────────────────────────
- deploy/app.sh up
-   1. create SSH key pair ───────────────────▶ key pair "spark-gd-app"
-   2. create firewall, allow only your IP ───▶ security group: ports 22 + 80
-   3. launch instance ───────────────────────▶ EC2 c7a.2xlarge, Amazon Linux 2023
-                                                 └─ user data installs Docker
-   4. deploy/deploy.sh:
-        rsync the project ───────────────────▶ ~/spark-app/
-        ssh: docker build, docker run ───────▶ container "spark-app"
-                                                 (Python 3.12, Java 21, Streamlit,
-                                                  restarts on its own after reboots)
-   5. wait for the health check, print URL
- Browser ── http://<ip> (port 80) ───────────▶ container port 8501 ─▶ app.py
-```
-
-- **Instance:** `c7a.2xlarge` (8 vCPUs, 16 GB, about $0.41/hour while running,
-  about $2.40/month for the 30 GB disk while stopped). On AMD `c7a`, each vCPU is
-  a full physical core, so 1→8 cores is a fair scaling test. On Intel types like
-  `c7i`, 8 vCPUs are only 4 physical cores with hyperthreading.
-- **Access:** only the IP address you ran `up` from can open the page (and SSH
-  in). On a different network, run `allow-ip`. To share the page with anyone,
-  set a password and open it up:
-  ```bash
-  APP_PASSWORD=choose-a-password deploy/app.sh deploy
-  deploy/app.sh public
-  ```
-- **Under the hood:** `up` creates the key pair (`~/.ssh/spark-gd-app.pem`) and a
-  security group, launches the instance with `deploy/user-data.sh` (installs
-  Docker), then runs `deploy/deploy.sh`, which copies the project with rsync,
-  builds the image on the instance, and starts the container on port 80, set to
-  restart if it stops (including after `stop` / `start`). The password is sent over
-  SSH's input, not the command line, so it never appears in the remote process list.
-
-### Things to know
-
-- Only one benchmark runs at a time across all users, so concurrent runs can't
-  distort each other's timings. Others see a "wait" message.
-- The site is plain HTTP, so the password and uploads are not encrypted. Keep
-  access restricted to your IPs unless you need to share it.
-- Uploads stay in the container's `/tmp`; the app deletes those of ended sessions.
-- **Stop the instance** when you're done. It is billed by the hour while running.
-
----
-
-## Walkthrough 3: the 4-machine Spark cluster on AWS (EMR)
-
-Walkthroughs 1 and 2 show that on data that fits in one machine's memory, plain NumPy
+Walkthrough 1 shows that on data that fits in one machine's memory, plain NumPy
 wins. `deploy/bigdata/` tests the case Spark is built for: data larger than one
 machine's memory. By default it uses 10 copies of the full HIGGS dataset
 (110M rows, 75 GB as CSV, 26 GB as float64); `--data` runs it on any CSV
@@ -592,7 +514,7 @@ So on data that fits in one machine's RAM, NumPy wins: it reads 230 MB from memo
 30 ms, which is less than Spark's fixed cost for a single iteration. Spark's overhead
 only becomes negligible when each iteration has much more data to process than one
 machine can hold in memory, which is exactly what
-[walkthrough 3](#walkthrough-3-the-4-machine-spark-cluster-on-aws-emr) measures.
+[walkthrough 2](#walkthrough-2-the-4-machine-spark-cluster-on-aws-emr) measures.
 
 ---
 
@@ -609,11 +531,11 @@ spark-project/
 ├── analyze.py       # Computes speedup / efficiency / serial fraction from results.csv
 ├── requirements.txt # Pinned Python dependencies
 ├── Dockerfile       # Container image for the app (Python 3.12 + Java 21)
-├── deploy/          # EC2 app deploy (walkthrough 2)
+├── deploy/          # Hosting the app on EC2 (see the appendix)
 │   ├── app.sh       #   one command: create, start, stop, deploy, delete the app machine
 │   ├── deploy.sh    #   copy the code to the machine, build and run the container
 │   ├── user-data.sh #   first-boot script: installs Docker
-│   └── bigdata/     # Cluster benchmark (walkthrough 3)
+│   └── bigdata/     # Cluster benchmark (walkthrough 2)
 │       ├── run.sh          # one command: check quotas, launch, status, results, down
 │       ├── emr_bootstrap.sh # runs on every cluster node: Python environment
 │       ├── emr_bench.sh    # runs on the master: prepare data, run Spark on 4 and 2 nodes
@@ -624,6 +546,61 @@ spark-project/
 ├── results_raw.csv  # Unfiltered measurement log (includes caught contamination)
 └── higgs_1m.csv     # 1M-row HIGGS subset (28 features + label) — not committed
 ```
+
+## Appendix: hosting the app on AWS
+
+The same app, hosted so anyone with the link can use it. Nothing about the Spark
+code changes: Spark still uses `local[N]`, now on the EC2 machine's 8 cores instead
+of the laptop's. The difference is a fair, quiet machine: 8 identical physical cores,
+no thermal throttling, no other apps.
+
+### Set up and start
+
+Requirements: the AWS CLI, configured with credentials and a region. The app runs in
+Docker (`Dockerfile`: Python 3.12 + Java 21). `deploy/app.sh` does the whole setup
+with the AWS CLI (no console clicking):
+
+```bash
+deploy/app.sh up        # first time: SSH key, firewall, instance, deploy (~8 min)
+deploy/app.sh stop      # pause it: no compute charge while stopped
+deploy/app.sh start     # resume; prints the new address (it changes on each start)
+deploy/app.sh deploy    # push code changes to the running instance
+deploy/app.sh allow-ip  # let in the network you are on now
+deploy/app.sh status
+deploy/app.sh down      # delete the instance and firewall
+```
+
+`up` prints the address (`http://<ip>`). Open it and use the app exactly as in
+[walkthrough 1](#walkthrough-1-the-app-on-your-laptop).
+
+### Details
+
+- **Instance:** `c7a.2xlarge` (8 vCPUs, 16 GB, about $0.41/hour while running,
+  about $2.40/month for the 30 GB disk while stopped). On AMD `c7a`, each vCPU is
+  a full physical core, so 1→8 cores is a fair scaling test. On Intel types like
+  `c7i`, 8 vCPUs are only 4 physical cores with hyperthreading.
+- **Access:** only the IP address you ran `up` from can open the page (and SSH
+  in). On a different network, run `allow-ip`. To share the page with anyone,
+  set a password and open it up:
+  ```bash
+  APP_PASSWORD=choose-a-password deploy/app.sh deploy
+  deploy/app.sh public
+  ```
+- **Under the hood:** `up` creates the key pair (`~/.ssh/spark-gd-app.pem`) and a
+  security group, launches the instance with `deploy/user-data.sh` (installs
+  Docker), then runs `deploy/deploy.sh`, which copies the project with rsync,
+  builds the image on the instance, and starts the container on port 80, set to
+  restart if it stops (including after `stop` / `start`). The password is sent over
+  SSH's input, not the command line, so it never appears in the remote process list.
+
+### Things to know
+
+- Only one benchmark runs at a time across all users, so concurrent runs can't
+  distort each other's timings. Others see a "wait" message.
+- The site is plain HTTP, so the password and uploads are not encrypted. Keep
+  access restricted to your IPs unless you need to share it.
+- Uploads stay in the container's `/tmp`; the app deletes those of ended sessions.
+- **Stop the instance** when you're done. It is billed by the hour while running.
 
 ## Notes
 
