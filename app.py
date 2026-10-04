@@ -181,7 +181,6 @@ def show_recommended_cores(table):
         return f"{c} core" + ("" if c == 1 else "s")
 
     st.subheader("Recommended cores")
-    st.caption("Quick estimate for this dataset on this machine.")
     st.metric("Recommended cores", rec)
     if rec_i == best_i:
         why = f"{n_cores(rec)} gave the highest speedup observed ({speedups[rec_i]:.2f}x)."
@@ -195,11 +194,6 @@ def show_recommended_cores(table):
     st.write(why)
     st.write("Parallel efficiency (speedup divided by cores): " + ", ".join(
         f"{n_cores(c)} {s / c:.0%}" for c, s in zip(cores, speedups)) + ".")
-    st.caption(
-        "Not general Spark guidance. It comes from one run per core count, "
-        "with this dataset, on this machine's cores (which may mix "
-        "performance and efficiency cores). It compares Spark runs with each "
-        "other only; see the NumPy comparison above for Spark vs. no Spark.")
 
 
 def comparison_chart(rows):
@@ -282,12 +276,6 @@ def show_numpy_comparison(runs, numpy, data_gb):
     rows.append(("NumPy, 1 process", np_s, "NumPy"))
     comparison_chart(rows)
     show_recommendation(*spark_recommendation(spark_s, np_s, numpy["gb"], machine_ram_gb()))
-    st.caption("NumPy runs the same gradient descent (same data, starting point, "
-               "learning rate and iterations) in one process with no Spark, "
-               "timed the same way: median per-iteration time, iteration 0 "
-               "dropped, loading excluded. Its matrix library may use several "
-               f"cores. Final loss: Spark {best['final_loss']:.6f}, "
-               f"NumPy {numpy['final_loss']:.6f}.")
 
 
 # The two single-machine NumPy setups run.sh launches:
@@ -380,7 +368,7 @@ def show_recorded():
             f"{runs[n][0].get('description', n)} ({runs[n][0].get('date', '')})"))
     else:
         run = names[0]
-    meta, setups = runs[run]
+    _, setups = runs[run]
 
     def ok(results):
         return [r for r in results if "error" not in r]
@@ -398,10 +386,6 @@ def show_recorded():
     features = first.get("features") or next(
         (r["features"] for r in numpy.values() if "features" in r), 0)
     data_gb = first["records"] * (features + 2) * 8 / 1e9
-
-    st.info(f"**Recorded, not live.** Measured on AWS on {meta.get('date', '?')}; a "
-            f"full run takes about an hour. {first['records']:,} rows "
-            f"({meta.get('description', run)}), {data_gb:.1f} GB as float64.")
 
     chart = [(f"Spark, {n} machine{'s' if n > 1 else ''} ({spark[n][0]['cores']} cores)",
               med[n], "Spark") for n in sorted(spark, reverse=True)]
@@ -447,10 +431,6 @@ def show_recorded():
     st.dataframe(pd.DataFrame(table), hide_index=True, column_config={
         "Seconds per iteration": st.column_config.NumberColumn(format="%.2f"),
         "Final loss": st.column_config.NumberColumn(format="%.6f")})
-    st.caption(f"Spark runs on EMR with {first.get('cached_fraction', 1.0):.0%} of the data "
-               "cached in memory. The 16 GB NumPy machine runs fewer iterations to save "
-               "time, so its final loss is from an earlier iteration. Raw results: "
-               f"deploy/bigdata/results/{run}/.")
 
 
 def show_results(res):
@@ -532,9 +512,6 @@ def show_results(res):
                       help="Final training loss of the Spark run vs. the "
                            "separate plain-NumPy run on the same data, after "
                            "the same number of iterations.")
-            st.caption(f"Final loss: Spark {spark_loss:.10f}, NumPy {np_loss:.10f}. "
-                       "Compared by loss because the data is too large to copy "
-                       "into this process for a weight-by-weight check.")
         else:
             st.metric("Matches single-machine NumPy", "Skipped")
             st.caption(f"Skipped: {check.get('ref_reason', 'not run')}.")
@@ -543,9 +520,6 @@ def show_results(res):
                   help="Direction agreement between our weights and "
                        "scikit-learn's unregularized LogisticRegression. "
                        "1.0 means the same direction.")
-        st.caption(f"Accuracy: ours {check['acc_mine']:.1%}, "
-                   f"scikit-learn {check['acc_sklearn']:.1%} "
-                   f"(on {check['sample_rows']:,} rows).")
     if check["sklearn_separable"]:
         st.warning(
             "scikit-learn classified every row correctly, which means the "
@@ -553,10 +527,6 @@ def show_results(res):
             "this its unregularized weights grow without limit, so a low "
             "cosine here does not indicate a bug. The NumPy comparison is "
             "the reliable check.")
-    elif check["cosine"] < 0.95:
-        st.caption(
-            "A cosine below about 0.95 usually means training has not "
-            "converged yet. Try more iterations.")
 
 
 def require_password():
