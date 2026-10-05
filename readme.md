@@ -518,7 +518,7 @@ Raw JSON is in `deploy/bigdata/results/higgs10x/`.
 | Non-Spark, 1 × r6id.2xlarge (64 GB, data in memory) | 5.53 | 2.0× slower | 0.650322 |
 | Non-Spark, 1 × m6id.xlarge (16 GB, re-reads from disk) | 80.93 | 30× slower | 0.668668 (6 iterations) |
 
-### What we learned
+### What I learned
 
 - **Spark only pays off when the data is too big for one machine.** On 1M rows
   the non-Spark version is 11× faster than Spark on the same laptop. On 110M rows
