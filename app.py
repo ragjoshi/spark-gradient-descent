@@ -199,7 +199,7 @@ def show_recommended_cores(table):
 def comparison_chart(rows):
     """Horizontal bars of seconds per iteration, in the given order.
 
-    rows: list of (name, seconds, kind) with kind "Spark" or "NumPy".
+    rows: list of (name, seconds, kind) with kind "Spark" or "Non-Spark".
     """
     df = pd.DataFrame(rows, columns=["Setup", "Seconds per iteration", "Kind"])
     df["Label"] = df["Seconds per iteration"].map(
@@ -210,7 +210,7 @@ def comparison_chart(rows):
         x=alt.X("Seconds per iteration:Q", title="Seconds per iteration (lower is faster)"),
     )
     bars = base.mark_bar().encode(
-        color=alt.Color("Kind:N", scale=alt.Scale(domain=["Spark", "NumPy"],
+        color=alt.Color("Kind:N", scale=alt.Scale(domain=["Spark", "Non-Spark"],
                                                   range=["#e25a1c", "#4c78a8"]),
                         legend=alt.Legend(title=None, orient="top")))
     text = base.mark_text(align="left", dx=4).encode(text="Label:N")
@@ -229,7 +229,7 @@ def machine_ram_gb():
 def spark_recommendation(spark_s, np_s, data_gb, ram_gb):
     """
     Whether to use Spark RDD for this data on this machine, from measured
-    times (np_s is None if the NumPy run failed). Returns (use_spark,
+    times (np_s is None if the non-Spark run failed). Returns (use_spark,
     headline, reasons).
     """
     fits = ram_gb is None or data_gb < ram_gb
@@ -237,11 +237,11 @@ def spark_recommendation(spark_s, np_s, data_gb, ram_gb):
     size += f"; this machine has {ram_gb:.0f} GB of RAM." if ram_gb else "."
     if np_s is None:
         return True, "Use Spark RDD", [
-            "Plain NumPy could not finish on this machine.", size]
+            "The non-Spark version could not finish on this machine.", size]
     if spark_s < np_s:
         return True, "Use Spark RDD", [
-            f"Spark was {np_s / spark_s:.1f}x faster than plain NumPy here.", size]
-    reasons = [f"Plain NumPy was {spark_s / np_s:.1f}x faster than Spark's best run.",
+            f"Spark was {np_s / spark_s:.1f}x faster than the non-Spark version here.", size]
+    reasons = [f"The non-Spark version was {spark_s / np_s:.1f}x faster than Spark's best run.",
                size + (" It fits, so one process can hold all of it." if fits else "")]
     if fits:
         reasons.append(
@@ -253,7 +253,7 @@ def spark_recommendation(spark_s, np_s, data_gb, ram_gb):
         if ram_gb and data_gb > 0.5 * ram_gb:
             reasons.append("The data already uses over half of this machine's "
                            "memory, so it is getting close to that point.")
-    return False, "Don't use Spark RDD for this data. Use plain NumPy.", reasons
+    return False, "Don't use Spark RDD for this data. Use the non-Spark version.", reasons
 
 
 def show_recommendation(use_spark, headline, reasons):
@@ -263,28 +263,28 @@ def show_recommendation(use_spark, headline, reasons):
 
 
 def show_numpy_comparison(runs, numpy, data_gb):
-    st.subheader("Spark vs. plain NumPy")
+    st.subheader("Spark vs. the non-Spark version")
     best = min(runs, key=lambda r: r["sec_per_iter_warm"])
     spark_s = best["sec_per_iter_warm"]
     if "error" in numpy:
-        st.warning("The NumPy comparison failed: " + numpy["error"])
+        st.warning("The non-Spark comparison failed: " + numpy["error"])
         show_recommendation(*spark_recommendation(spark_s, None, data_gb, machine_ram_gb()))
         return
     np_s = numpy["sec_per_iter_warm"]
     rows = [(f"Spark, {r['cores']} core" + ("" if r["cores"] == 1 else "s"),
              r["sec_per_iter_warm"], "Spark") for r in runs]
-    rows.append(("NumPy, 1 process", np_s, "NumPy"))
+    rows.append(("Non-Spark, 1 process", np_s, "Non-Spark"))
     comparison_chart(rows)
     show_recommendation(*spark_recommendation(spark_s, np_s, numpy["gb"], machine_ram_gb()))
 
 
-# The two single-machine NumPy setups run.sh launches:
+# The two single-machine non-Spark setups run.sh launches:
 # name -> (chart label, table label, short label).
 NUMPY_SETUPS = {
-    "numpy-64gb": ("NumPy, one 64 GB machine (data in RAM)",
-                   "NumPy, r6id.2xlarge (64 GB, in RAM)", "NumPy on 64 GB"),
-    "numpy-16gb": ("NumPy, one 16 GB machine (re-reads from disk)",
-                   "NumPy, m6id.xlarge (16 GB, from NVMe)", "NumPy on 16 GB"),
+    "numpy-64gb": ("Non-Spark, one 64 GB machine (data in RAM)",
+                   "Non-Spark, r6id.2xlarge (64 GB, in RAM)", "non-Spark on 64 GB"),
+    "numpy-16gb": ("Non-Spark, one 16 GB machine (re-reads from disk)",
+                   "Non-Spark, m6id.xlarge (16 GB, from NVMe)", "non-Spark on 16 GB"),
 }
 
 
@@ -320,25 +320,25 @@ def recorded_recommendation(spark_s, nodes, np16_s, np64_s, data_gb, cached):
     spark = f"Spark on {nodes} machines"
     reasons = []
     if np16_s is not None and np16_s <= spark_s:
-        return False, "Don't use Spark RDD for this data. Use plain NumPy.", [
+        return False, "Don't use Spark RDD for this data. Use the non-Spark version.", [
             f"Even the 16 GB machine was {spark_s / np16_s:.1f}x faster than {spark}.",
             f"The data ({data_gb:.1f} GB in memory) is small enough for one ordinary machine."]
     if np64_s is not None and np64_s <= 1.1 * spark_s:
         reasons.append(f"The data ({data_gb:.1f} GB in memory) fits in one 64 GB machine, "
-                       f"and NumPy there ({np64_s:.2f} s per iteration) was as fast as "
+                       f"and the non-Spark version there ({np64_s:.2f} s per iteration) was as fast as "
                        f"{spark} ({spark_s:.2f} s) or faster.")
         if np16_s is not None:
-            reasons.append(f"On a 16 GB machine NumPy re-reads it from disk and was "
+            reasons.append(f"On a 16 GB machine the non-Spark version re-reads it from disk and was "
                            f"{np16_s / spark_s:.0f}x slower than Spark, so the machine "
                            "needs enough RAM.")
-        return False, "One big machine is enough. Use plain NumPy on a machine with enough RAM.", reasons
+        return False, "One big machine is enough. Use the non-Spark version on a machine with enough RAM.", reasons
     if np64_s is not None:
         if np16_s is not None:
             reasons.append(f"The data ({data_gb:.1f} GB in memory) is bigger than the 16 GB "
-                           f"machine's RAM, so plain NumPy re-reads it from disk every "
+                           f"machine's RAM, so the non-Spark version re-reads it from disk every "
                            f"iteration; {spark} keeps it in memory and is "
                            f"{np16_s / spark_s:.0f}x faster.")
-        reasons.append(f"{spark} was also {np64_s / spark_s:.1f}x faster than NumPy on one "
+        reasons.append(f"{spark} was also {np64_s / spark_s:.1f}x faster than the non-Spark version on one "
                        "64 GB machine. That machine is the simpler option if its speed is "
                        "enough; Spark keeps scaling as machines are added.")
         headline = "Use Spark RDD if you can run a cluster"
@@ -346,7 +346,7 @@ def recorded_recommendation(spark_s, nodes, np16_s, np64_s, data_gb, cached):
         reasons.append(f"The data ({data_gb:.1f} GB in memory) does not fit even in a 64 GB "
                        f"machine; {spark} holds it in memory across machines.")
         if np16_s is not None:
-            reasons.append(f"NumPy streaming it from disk on one machine was "
+            reasons.append(f"The non-Spark version streaming it from disk on one machine was "
                            f"{np16_s / spark_s:.0f}x slower.")
         headline = "Use Spark RDD for this data"
     if cached < 1.0:
@@ -389,7 +389,7 @@ def show_recorded():
 
     chart = [(f"Spark, {n} machine{'s' if n > 1 else ''} ({spark[n][0]['cores']} cores)",
               med[n], "Spark") for n in sorted(spark, reverse=True)]
-    chart += [(NUMPY_SETUPS[k][0], v, "NumPy") for k, v in np_s.items() if v is not None]
+    chart += [(NUMPY_SETUPS[k][0], v, "Non-Spark") for k, v in np_s.items() if v is not None]
     comparison_chart(chart)
     for k, r in numpy.items():
         if "error" in r:
@@ -417,9 +417,9 @@ def show_recorded():
         a, b = first["final_loss"], numpy["numpy-64gb"]["final_loss"]
         same = (first["iters"] == numpy["numpy-64gb"]["iters"]
                 and abs(a - b) <= 1e-9 * max(1.0, abs(b)))
-        st.write(f"**Same answer:** Spark and NumPy both end at loss {a:.6f} after "
+        st.write(f"**Same answer:** Spark and the non-Spark version both end at loss {a:.6f} after "
                  f"{first['iters']} iterations." if same else
-                 f"Final loss: Spark {a:.6f}, NumPy (64 GB) {b:.6f}.")
+                 f"Final loss: Spark {a:.6f}, non-Spark (64 GB) {b:.6f}.")
 
     table = [{"Setup": f"Spark, {n} machine{'s' if n > 1 else ''}",
               "Seconds per iteration": med[n], "Runs": len(spark[n]),
@@ -474,7 +474,7 @@ def show_results(res):
     )
 
     if res.get("numpy"):
-        # label + intercept + features, float64; NumPy reports the same figure.
+        # label + intercept + features, float64; the non-Spark run reports the same figure.
         data_gb = res["rows"] * (res["features"] + 2) * 8 / 1e9
         show_numpy_comparison(runs, res["numpy"], data_gb)
 
@@ -495,25 +495,25 @@ def show_results(res):
     a, b = st.columns(2)
     with a:
         if check.get("ref_checked"):
-            st.metric("Matches single-machine NumPy",
+            st.metric("Matches single-machine non-Spark version",
                       "Yes" if check["ref_match"] else "No",
                       help="The same gradient descent (same data, start, "
-                           "learning rate and iterations) rerun with plain "
-                           "NumPy on one machine.")
+                           "learning rate and iterations) rerun without "
+                           "Spark on one machine.")
             st.caption(f"Largest weight difference: {check['ref_max_abs_diff']:.1e}. "
                        "Differences near 1e-16 are floating-point rounding "
                        "from adding partition sums in a different order.")
         elif res.get("numpy") and "error" not in res["numpy"]:
             # Too many rows to copy the data into this process, but the
-            # separate NumPy run trained on the same data: compare its loss.
+            # separate non-Spark run trained on the same data: compare its loss.
             spark_loss, np_loss = check["final_loss"], res["numpy"]["final_loss"]
             same = abs(spark_loss - np_loss) <= 1e-9 * max(1.0, abs(np_loss))
-            st.metric("Matches single-machine NumPy", "Yes" if same else "No",
+            st.metric("Matches single-machine non-Spark version", "Yes" if same else "No",
                       help="Final training loss of the Spark run vs. the "
-                           "separate plain-NumPy run on the same data, after "
+                           "separate non-Spark run on the same data, after "
                            "the same number of iterations.")
         else:
-            st.metric("Matches single-machine NumPy", "Skipped")
+            st.metric("Matches single-machine non-Spark version", "Skipped")
             st.caption(f"Skipped: {check.get('ref_reason', 'not run')}.")
     with b:
         st.metric("Cosine similarity vs scikit-learn", f"{check['cosine']:.4f}",
@@ -525,7 +525,7 @@ def show_results(res):
             "scikit-learn classified every row correctly, which means the "
             "classes can be split perfectly by a straight line. On data like "
             "this its unregularized weights grow without limit, so a low "
-            "cosine here does not indicate a bug. The NumPy comparison is "
+            "cosine here does not indicate a bug. The non-Spark comparison is "
             "the reliable check.")
 
 
@@ -549,7 +549,7 @@ st.title("Spark Scaling Lab")
 st.write(
     "Distributed logistic regression, written from scratch on Spark's RDD API "
     "(batch gradient descent, no MLlib). See how it speeds up as Spark gets "
-    "more cores, and how it compares with plain NumPy on one machine.")
+    "more cores, and how it compares with a non-Spark version on one machine.")
 
 live, recorded = st.tabs(["Run on this machine", "Recorded cluster runs (AWS)"])
 
@@ -628,7 +628,7 @@ with live:
 
     counts = core_counts(max_cores)
     st.caption(f"Will run Spark with {', '.join(map(str, counts))} core(s), one "
-               "Spark process each, then the same training in plain NumPy.")
+               "Spark process each, then the same training without Spark.")
 
     run_key = data_key + (mode,)
     if st.button("Run benchmark", type="primary"):
@@ -657,7 +657,7 @@ with live:
                 if last:
                     check = result
             progress.progress(len(counts) / steps,
-                              text=f"Plain NumPy, no Spark ({steps} of {steps})...")
+                              text=f"Non-Spark version ({steps} of {steps})...")
             numpy = run_numpy(data_path, label, iters)
             progress.empty()
             st.session_state.results = {"runs": runs, "check": check, "numpy": numpy,
